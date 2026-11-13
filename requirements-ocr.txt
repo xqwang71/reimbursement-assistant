@@ -1,0 +1,5 @@
+-r requirements.txt
+Pillow>=10,<13
+python-docx>=1.1,<2
+rapidocr==3.9.2
+onnxruntime>=1.19,<2

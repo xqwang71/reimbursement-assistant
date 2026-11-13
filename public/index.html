@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>报销助手开源版</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><h1>报销助手开源版</h1><p>查看待报销金额，匹配经费，核对后填报。</p></div>
+    <button id="openSettings" class="settings-trigger" type="button" aria-haspopup="dialog">设置</button>
+  </header>
+  <main>
+    <aside id="demoIntro" class="system-access mode-notice" hidden>
+      <div><strong>示例模式</strong><p>下方汇总使用虚构的项目和报销记录。项目甲的执行率应为 15%。</p></div>
+      <button id="setupLive" class="primary" type="button">设置我的报销</button>
+    </aside>
+    <aside id="schoolAccess" class="system-access" aria-label="报销系统登录说明" hidden>
+      <p><strong>智能报销系统</strong>　校外可直接扫码登录。</p>
+      <p><strong>学校财务系统</strong>　校外访问 cwc.suibe.edu.cn 时，先下载并登录 <a href="https://lxr.suibe.edu.cn/" target="_blank" rel="noopener noreferrer">零信任客户端（aTrust）</a>，再从 <a href="https://aws.suibe.edu.cn/" target="_blank" rel="noopener noreferrer">学校一网通办</a> 进入。</p>
+    </aside>
+    <section class="panel worklist-panel">
+      <div id="liveWorklist" hidden>
+      <div class="panel-title"><div><h2>批量工作清单</h2><p>左栏合并文件夹时选择办理方式，中栏填写事由，右栏选择经费。勾选核对好的事项后执行。</p></div><button id="refreshFolders" class="secondary" type="button">刷新文件夹</button></div>
+      <div class="matching-tools">
+        <div id="matchTarget" class="match-target">请在中间选择报销事项。</div>
+        <div class="school-controls">
+          <div class="school-status">
+            <span id="projectStatus" class="muted" role="status">正在读取项目列表…</span>
+            <div class="school-actions">
+              <button id="checkLogin" class="text-button" type="button">检查校园网登录</button>
+              <button id="syncProjects" class="secondary" type="button">同步项目和余额</button>
+            </div>
+          </div>
+          <p id="loginStatus" class="muted" role="status" hidden></p>
+        </div>
+      </div>
+      <div class="matching-layout">
+        <section class="match-pane source-pane" aria-labelledby="sourceHeading">
+          <div class="match-heading"><h3 id="sourceHeading">1　来源文件夹</h3><span id="sourceCount" class="muted"></span></div>
+          <div class="match-filter"><input id="sourceFilter" type="search" aria-label="筛选来源文件夹" placeholder="搜索来源文件夹"></div>
+          <div class="source-actions">
+            <button id="createClaim" class="primary" type="button">合并为报销事项</button>
+            <button id="addToClaim" class="secondary" type="button" disabled>加入当前事项</button>
+          </div>
+          <p id="sourceSelection" class="muted" role="status">先勾选属于同一事项的文件夹。</p>
+          <div id="sourceRows" class="match-list"></div>
+        </section>
+        <section class="match-pane" aria-labelledby="folderHeading">
+          <div class="match-heading"><h3 id="folderHeading">2　报销事项</h3><span id="folderCount" class="muted"></span></div>
+          <div class="match-filter">
+            <input id="folderFilter" type="search" aria-label="筛选报销事项" placeholder="搜索事项或来源文件夹">
+            <select id="claimRouteFilter" aria-label="筛选办理系统">
+              <option value="">全部系统</option>
+              <option value="smart">智能报销系统</option>
+              <option value="legacy">学校财务系统 · 日常线下报销</option>
+              <option value="labor">薪酬申报</option>
+              <option value="didi">贸大出行</option>
+            </select>
+          </div>
+          <div class="source-actions">
+            <button id="mergeClaims" class="secondary" type="button" disabled>合并勾选事项</button>
+            <button id="addDidiClaim" class="secondary" type="button">新增贸大出行</button>
+          </div>
+          <div id="schoolFinanceEntry" hidden>
+            <div class="source-actions">
+              <button id="addPayroll" class="primary" type="button" hidden>新增薪酬申报</button>
+              <button id="checkSchoolFinance" class="secondary" type="button">核对学校填报入口</button>
+            </div>
+            <p id="schoolFinanceStatus" class="muted" role="status"></p>
+          </div>
+          <p id="claimInstructions" class="muted">点卡片匹配经费。</p>
+          <div id="folderRows" class="match-list">正在读取报销事项…</div>
+        </section>
+        <section id="matchingProjects" class="match-pane" aria-labelledby="projectHeading">
+          <div class="match-heading"><h3 id="projectHeading">3　经费项目</h3></div>
+          <div class="match-filter">
+            <input id="projectFilter" type="search" aria-label="筛选经费项目" placeholder="搜索项目名称或编号">
+            <label for="matchFunding">口径</label><select id="matchFunding"><option>教学</option><option>科研</option></select>
+          </div>
+          <p class="project-balance-source">劳务费金额可在学校财务系统查询。<a href="https://authserver.suibe.edu.cn/authserver/login?service=http%3A%2F%2Fcwc.suibe.edu.cn%3A8088%2FSalaryDeclare%2FExternalLogin.aspx" target="_blank" rel="noopener noreferrer">打开薪酬申报</a></p>
+          <div id="projectRows" class="match-list"></div>
+        </section>
+      </div>
+      <details id="manualMatch">
+        <summary>手动匹配项目</summary>
+        <form id="manualProjectForm" class="manual-match-form">
+          <label>项目编号<input id="manualProjectNo" required></label>
+          <label>项目名称<input id="manualProjectName" required></label>
+          <button class="secondary" type="submit">匹配手动项目</button>
+        </form>
+      </details>
+      <div class="toolbar">
+        <button id="selectAll" class="secondary" type="button">全选可执行的事项</button>
+        <button id="checkSelected" class="secondary" type="button">重新检查事项</button>
+        <button id="executeSelected" class="primary inline" type="button" title="开始填报，在提交前逐笔确认">填报选中项</button>
+        <span id="selectionCount" class="muted"></span>
+      </div>
+      <div id="executionFeedback" class="execution-feedback" hidden>
+        <p id="executionStatus" role="status"></p>
+        <button id="executionDetails" class="secondary" type="button" hidden>查看详情</button>
+      </div>
+      <p id="worklistStatus" class="muted" role="status">正在读取工作清单…</p>
+      <details id="reimbursedHistory" class="reimbursed-history" hidden>
+        <summary id="historyHeading">已报销</summary>
+        <ul id="historyRows"></ul>
+      </details>
+      <details id="reviewArchive" class="reimbursed-history review-archive" hidden>
+        <summary id="reviewArchiveHeading">旧审核档案</summary>
+        <label class="search">搜索旧批次<input id="reviewArchiveSearch" type="search" autocomplete="off"></label>
+        <p id="reviewArchiveStatus" class="muted" role="status"></p>
+        <ul id="reviewArchiveRows"></ul>
+      </details>
+      </div>
+      <section class="funding-summary" aria-labelledby="fundingTitle">
+        <div class="panel-title funding-heading">
+          <div><h2 id="fundingTitle">报销汇总</h2><p id="fundingPeriod"></p></div>
+          <div class="funding-actions">
+            <button id="fundingSync" class="primary" type="button" hidden>同步学校执行表</button>
+            <button id="fundingRefresh" class="secondary" type="button">重新读取执行表</button>
+          </div>
+        </div>
+        <div id="fundingSyncStatus" class="funding-sync-status" hidden>
+          <p id="fundingSyncMessage" role="status"></p>
+          <ul id="fundingSyncSources"></ul>
+          <button id="fundingSyncStop" class="secondary" type="button" hidden>停止同步</button>
+        </div>
+        <p id="fundingStatus" class="muted" role="status">正在读取年度执行表…</p>
+        <div id="fundingContent" hidden>
+          <div id="fundingTotals" class="funding-totals"></div>
+          <div id="fundingLegend" class="funding-legend"></div>
+          <p id="fundingScope" class="muted"></p>
+          <div id="fundingProjects" class="funding-projects"></div>
+          <details id="fundingReceipts" class="funding-data" hidden>
+            <summary id="fundingReceiptsHeading">执行器回执核对</summary>
+            <div id="fundingReceiptRows"></div>
+          </details>
+          <div id="fundingChecks"></div>
+          <details id="fundingData" class="funding-data">
+            <summary>数据来源与导出</summary>
+            <ul id="fundingSources"></ul>
+            <div class="funding-downloads">
+              <a href="/api/funding-summary?export=projects" download>导出项目汇总 CSV</a>
+              <a href="/api/funding-summary?export=details" download>导出报销明细 CSV</a>
+            </div>
+          </details>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="reviewArchiveDialog" class="settings-dialog" aria-labelledby="reviewArchiveTitle">
+    <header class="modal-header">
+      <h2 id="reviewArchiveTitle">旧审核批次</h2>
+      <button id="closeReviewArchive" class="modal-close" type="button" aria-label="关闭旧审核批次">×</button>
+    </header>
+    <div id="reviewArchiveContent" class="modal-content review-archive-content"></div>
+  </dialog>
+
+  <button id="runToggle" class="run-toggle" type="button" aria-controls="runDrawer" aria-expanded="false" hidden>执行与互动<span id="runBadge" class="run-badge" hidden></span></button>
+
+  <aside id="runDrawer" class="run-drawer" hidden>
+    <section class="panel run-panel">
+      <div class="panel-title"><div><h2>执行与互动</h2><p>可回复当前步骤的问题，也可发送暂停、继续或先别提交。</p></div><button id="runClose" class="modal-close run-close" type="button" aria-label="收起">×</button></div>
+      <div id="runStatus" class="run-status idle">尚未执行</div>
+      <div id="batchQueue" class="batch-queue"></div>
+      <div id="timeline" class="timeline"></div>
+      <div id="messages" class="messages"><div class="empty-chat">启动批次后，这里会显示执行问题；你也可以随时发指令。</div></div>
+      <div id="submissionActions" class="settings-actions" hidden>
+        <button id="confirmSubmission" class="primary" type="button">确认提交本笔</button>
+        <button id="skipSubmission" class="secondary" type="button">先别提交</button>
+      </div>
+      <form id="replyForm" class="reply-form">
+        <input id="replyInput" placeholder="暂停、继续、重试、别提交，或询问执行状态" autocomplete="off">
+        <button id="replyButton" class="secondary" type="submit">发送</button>
+      </form>
+    </section>
+  </aside>
+
+  <dialog id="claimRouteDialog" class="settings-dialog claim-route-dialog" aria-labelledby="claimRouteTitle">
+    <header class="modal-header"><h2 id="claimRouteTitle">办理方式</h2></header>
+    <form id="claimRouteForm" class="settings-content">
+      <div class="settings-fields">
+        <label for="claimRouteChoice">办理系统</label>
+        <select id="claimRouteChoice" autofocus>
+          <option value="smart">智能报销系统（默认）</option>
+          <option value="legacy">日常线下报销</option>
+        </select>
+        <p class="muted">纯外币付款按日常线下报销办理。</p>
+      </div>
+      <div class="settings-actions">
+        <button id="saveClaimRoute" class="primary" type="submit">合并</button>
+        <button id="cancelClaimRoute" class="secondary" type="button">取消</button>
+        <p id="claimRouteStatus" class="muted" role="status"></p>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsTitle">
+    <header class="modal-header">
+      <h2 id="settingsTitle">设置</h2>
+      <button id="closeSettings" class="modal-close" type="button" aria-label="关闭设置">×</button>
+    </header>
+    <div class="settings-content">
+      <form id="basicSettingsForm">
+        <h3>基本信息</h3>
+        <div class="settings-fields basic-settings-fields">
+          <label>票据根目录<input id="sourceRoot" placeholder="粘贴本机年度票据文件夹路径" required autocomplete="off"></label>
+          <label>公务卡尾号<input id="paymentCardLast4" type="password" maxlength="4" pattern="[0-9]{4}" inputmode="numeric" autocomplete="off" placeholder="公务卡尾号 4 位"></label>
+          <label>教学常用加签人<input id="teachingSigner" maxlength="80" autocomplete="off"></label>
+          <label>教学加签人工号（可选）<input id="teachingSignerCode" maxlength="30" autocomplete="off"></label>
+          <label>科研常用加签人<input id="researchSigner" maxlength="80" autocomplete="off"></label>
+          <label>科研加签人工号（可选）<input id="researchSignerCode" maxlength="30" autocomplete="off"></label>
+          <label>预约校区<select id="bookingCampus"><option value="松江">松江</option><option value="长宁">长宁</option></select></label>
+          <label class="checkbox-field"><input id="autoPrint" type="checkbox"> 保存预约 PDF 后用本机默认打印机打印</label>
+        </div>
+        <details class="payment-settings">
+          <summary>学校支付类型</summary>
+          <div class="settings-fields basic-settings-fields">
+            <label>智能报销<input id="smartPaymentLabel" maxlength="80" required></label>
+            <label>线下预约<input id="legacyPaymentLabel" maxlength="80" required></label>
+          </div>
+        </details>
+        <details class="payment-settings">
+          <summary>按项目指定科研经费</summary>
+          <div class="settings-fields">
+            <label>自动归为科研的项目编号<textarea id="researchProjectNos" rows="3" maxlength="10100" placeholder="每行一个。适用于之后保存的项目匹配。" autocomplete="off" spellcheck="false"></textarea></label>
+          </div>
+        </details>
+        <div class="settings-actions">
+          <button id="saveRoot" class="primary" type="submit">保存基本信息</button>
+          <button id="returnToDemo" class="secondary" type="button" hidden>切换到示例</button>
+          <p id="basicSettingsStatus" class="muted" role="status"></p>
+        </div>
+      </form>
+      <form id="modelSettingsForm" hidden>
+        <div class="settings-columns">
+          <section aria-labelledby="connectionTitle">
+            <div class="settings-section-heading"><h3 id="connectionTitle">连接与凭据</h3><button id="addModelConnection" class="text-button" type="button">添加连接</button></div>
+            <div class="settings-fields">
+              <label>编辑连接<select id="modelConnectionChoice"></select></label>
+              <label>连接名称<input id="modelConnectionName" maxlength="80"></label>
+              <label>连接方式<select id="modelConnectionKind"><option value="api">兼容 Responses 的 API</option><option value="codex">Codex 本机登录</option></select></label>
+              <label id="modelApiUrlField">API 地址<input id="modelApiUrl" type="url" placeholder="https://api.deepseek.com"></label>
+              <label id="modelApiKeyField">API Key 环境变量名<input id="modelApiKey" placeholder="如 REIMBURSEMENT_API_KEY" autocomplete="off" spellcheck="false"></label>
+              <p id="modelConnectionStatus" class="muted"></p>
+            </div>
+          </section>
+          <section aria-labelledby="modelTitle">
+            <div class="settings-section-heading"><h3 id="modelTitle">模型配置</h3><button id="addModelProfile" class="text-button" type="button">添加模型</button></div>
+            <div class="settings-fields">
+              <label>编辑模型<select id="modelProfileChoice"></select></label>
+              <label>配置名称<input id="modelProfileName" maxlength="80"></label>
+              <label>使用连接<select id="modelProfileConnection"></select></label>
+              <label>模型名称<input id="modelProfileId" maxlength="120" spellcheck="false"></label>
+              <label>思考深度<select id="modelEffort"><option value="">模型默认</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">很高</option><option value="max">最高</option><option value="ultra">Ultra</option></select></label>
+              <p id="modelProfileStatus" class="muted"></p>
+            </div>
+          </section>
+        </div>
+        <section aria-labelledby="modelUsesTitle">
+          <h3 id="modelUsesTitle">使用场景</h3>
+          <p class="muted">开启后会把所选场景需要的提取文字、金额、行程或执行消息发给所选模型。附件使用代号，常见证件号、卡号和带标签的姓名会在发送前遮盖。</p>
+          <div id="modelAssignments" class="settings-fields settings-assignments"></div>
+        </section>
+        <button id="saveModelSettings" class="primary" type="submit">保存模型设置</button>
+      </form>
+      <p id="modelSettingsStatus" class="muted" role="status"></p>
+    </div>
+  </dialog>
+  <dialog id="didiDialog" class="settings-dialog" aria-labelledby="didiTitle">
+    <header class="modal-header">
+      <h2 id="didiTitle">新增贸大出行</h2>
+      <button id="closeDidi" class="modal-close" type="button" aria-label="关闭贸大出行">×</button>
+    </header>
+    <form id="didiForm" class="settings-content">
+      <div class="edit-grid"><label>预算上限（元）<input id="didiBudget" name="budget" type="number" min="0.01" max="999999999.99" step="0.01" inputmode="decimal" required></label></div>
+      <p class="muted">保存后填写报销事由，在右栏匹配经费。</p>
+      <div class="settings-actions">
+        <button id="saveDidi" class="primary" type="submit">保存预算</button>
+        <p id="didiStatus" class="muted" role="status"></p>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="payrollDialog" class="settings-dialog" aria-labelledby="payrollTitle">
+    <header class="modal-header">
+      <h2 id="payrollTitle">新增薪酬申报</h2>
+      <button id="closePayroll" class="modal-close" type="button" aria-label="关闭薪酬申报表">×</button>
+    </header>
+    <form id="payrollForm" class="settings-content">
+      <div class="edit-grid">
+        <label>薪酬套类<select id="payrollCategory" name="category" required></select></label>
+        <label>发放类型<input name="grantType" list="payrollGrantTypes" maxlength="100" required></label>
+        <datalist id="payrollGrantTypes"><option value="科研项目"></option><option value="非科研项目"></option></datalist>
+        <label>加签人<output id="payrollSigner" aria-live="polite">待确认</output></label>
+        <label>本笔加签人（可选）<input name="signerName" maxlength="80" autocomplete="off"></label>
+        <label>本笔加签人工号（可选）<input name="signerEmployeeNo" maxlength="30" autocomplete="off"></label>
+        <label class="edit-wide">发放内容（报销事由）<textarea name="reason" rows="2" maxlength="100" required></textarea></label>
+      </div>
+      <h3>发放明细</h3>
+      <div id="payrollPeople"></div>
+      <div class="settings-actions payroll-total">
+        <button id="addPayrollPerson" class="secondary" type="button">添加一条明细</button>
+        <output id="payrollTotal" aria-live="polite"></output>
+      </div>
+      <div class="settings-actions">
+        <button id="savePayroll" class="primary" type="submit">保存申报</button>
+        <p id="payrollStatus" class="muted" role="status"></p>
+      </div>
+    </form>
+  </dialog>
+  <template id="payrollPersonTemplate">
+    <fieldset class="payroll-person">
+      <legend></legend>
+      <div class="edit-grid">
+        <label>姓名<input name="name" maxlength="50" required autocomplete="off"></label>
+        <label>选择人员<select class="payroll-person-choice" aria-label="按姓名和尾号选择人员"></select></label>
+        <input type="hidden" name="recipientKey">
+        <input type="hidden" name="identityTail">
+        <label>职称职务<select name="position" required></select></label>
+        <div class="edit-wide payroll-person-search">
+          <button type="button" class="text-button find-payroll-person" hidden>查学校人员</button>
+          <span class="muted payroll-person-status" role="status"></span>
+        </div>
+        <label>工作学时<input name="hours" type="number" min="0" max="99999.99" step="0.01"></label>
+        <label class="payroll-expense-item" hidden>费用项<select name="expenseItem" disabled></select></label>
+        <label>应发金额（元）<input name="amount" type="number" min="0.01" max="999999999.99" step="0.01" required></label>
+        <label class="edit-wide">用途<textarea name="purpose" rows="2" placeholder="写明课程或项目，以及这条劳务明细对应的具体工作" required></textarea></label>
+        <button class="text-button remove-payroll-person" type="button">移除此条明细</button>
+      </div>
+    </fieldset>
+  </template>
+
+  <div id="detailModal" class="modal" hidden>
+    <div class="modal-backdrop" data-close-detail></div>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="detailTitle">
+      <div class="modal-header">
+        <div><h2 id="detailTitle">检查详情</h2><p id="detailSubtitle" class="muted"></p></div>
+        <button id="closeDetail" class="modal-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <div id="detailContent" class="modal-content"></div>
+    </div>
+  </div>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
