@@ -79,10 +79,17 @@ async function setup(t, options = {}) {
     }
     await this.ask('核对模拟草稿后再确认提交', { kind: 'final_approval' });
     return 'preview';`;
+  const amountReviewExecution = `
+    const reply = await this.ask('请在学校页面核对金额，再回复重新核对。', { kind: 'amount_review' });
+    if (reply !== '继续') throw Error('unexpected amount review reply');
+    return 'preview';`;
+  const waitingExecution = options.projectExpenseQuestion
+    ? "return await this.ask('本笔请选择费用科目',{kind:'project_expense_type',choices:[{value:'1',label:'办公费'},{value:'2',label:'其他教学杂项费用'}]});"
+    : options.amountReviewQuestion ? amountReviewExecution : "await this.ask('本地测试等待用户输入',{kind:'pause'});return 'preview';";
   await writeFile(join(code, 'lib/executor.mjs'), `import {access, writeFile} from 'node:fs/promises';
 export class ReimbursementExecutor {
 constructor(options){Object.assign(this,options);}
-async run(){${options.requireLogin ? `await access(${JSON.stringify(loginReady)}).catch(()=>{throw new Error('未找到学校财务首页的“智能网报5.0”。请检查专用浏览器的校园网登录状态。');});` : ''}await writeFile(${JSON.stringify(started)},'started');this.control.progress.ownedDocument=true;await this.onProgress();${options.previewExecution ? previewExecution : options.submit ? "this.control.progress.submission={state:'verified',financeFormId:'TEST-SCHOOL-123',verifiedAt:new Date().toISOString()};await this.onProgress();return 'submitted';" : options.projectExpenseQuestion ? "return await this.ask('本笔请选择费用科目',{kind:'project_expense_type',choices:[{value:'1',label:'办公费'},{value:'2',label:'其他教学杂项费用'}]});" : "await this.ask('本地测试等待用户输入',{kind:'pause'});return 'preview';"}}
+async run(){${options.requireLogin ? `await access(${JSON.stringify(loginReady)}).catch(()=>{throw new Error('未找到学校财务首页的“智能网报5.0”。请检查专用浏览器的校园网登录状态。');});` : ''}await writeFile(${JSON.stringify(started)},'started');this.control.progress.ownedDocument=true;await this.onProgress();${options.previewExecution ? previewExecution : options.submit ? "this.control.progress.submission={state:'verified',financeFormId:'TEST-SCHOOL-123',verifiedAt:new Date().toISOString()};await this.onProgress();return 'submitted';" : waitingExecution}}
 }
 `);
   await writeFile(join(code, 'lib/browser-session.mjs'), `export async function getBrowserSession(){throw Error('test must not open any financial browser');} export async function savePlatformSession(){} export async function savedPlatformUrl(){return '';} export async function browserTargetId(){return null;} export async function browserPageForTarget(){return null;}`);
@@ -273,6 +280,31 @@ test('a project expense answer is routed to the live question without interpreti
   assert.match(ambiguous.body.run.messages.at(-1).text, /请选择本笔的费用科目/);
   await app.request(route + '/instructions', { message: '都是 全部填入 其他教育杂项费用' });
   assert.equal((await wait('preview')).result, '2');
+});
+
+test('amount review waits through general chat and resumes for an explicit recheck', async (t) => {
+  const app = await setup(t, { amountReviewQuestion: true });
+  const plan = await app.plan();
+  const started = await app.request('/api/runs', { planId: plan.id });
+  assert.equal(started.status, 202);
+  const route = `/api/runs/${started.body.run.id}`;
+  const waitFor = async (status) => {
+    const deadline = Date.now() + 2500;
+    do {
+      const { run } = (await app.request(route)).body;
+      if (run.status === status) return run;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } while (Date.now() < deadline);
+    assert.fail('execution did not reach ' + status);
+  };
+  assert.equal((await waitFor('waiting_input')).pendingKind, 'amount_review');
+  assert.equal((await app.request(route + '/replies', { message: '这里是什么金额' })).status, 409);
+  const chat = await app.request(route + '/instructions', { message: '我在看页面' });
+  assert.equal(chat.body.run.status, 'waiting_input');
+  assert.match(chat.body.run.messages.at(-1).text, /重新核对/);
+  const recheck = await app.request(route + '/instructions', { message: '你来核对下' });
+  assert.match(recheck.body.run.messages.at(-1).text, /正在重新读取学校费用明细/);
+  await waitFor('preview');
 });
 
 test('continuing a batch after campus login resumes the original run', async (t) => {

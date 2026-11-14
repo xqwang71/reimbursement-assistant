@@ -1728,6 +1728,56 @@ test('a grouped school detail uses the verified original upload and binds its dr
   await assert.rejects(instance.assertDocumentIdentity(), /草稿已变化/);
 });
 
+test('a school-truncated grouped purpose is shown for approval and rechecked before submission', async (t) => {
+  const { instance, frame, page, plan } = await setup(t, 'detail');
+  plan.reason = '模拟实验课程演示软件许可费';
+  const actualPurpose = '模拟实验课程演示软件';
+  const files = ['模拟票据甲.pdf', '模拟票据乙.pdf', '模拟支付.png'];
+  plan.uploadFiles = files.map((name) => ({ name }));
+  const { invoiceNumber } = plan.rows[0];
+  plan.rows = [6100, 3700].map((amountCny, index) => ({
+    invoiceNumber: invoiceNumber.slice(0, -1) + (index + 1), invoiceFile: files[index],
+    invoiceAmountCny: amountCny, paidAmountCny: amountCny, reimbursementAmountCny: amountCny,
+  }));
+  plan.totalCny = plan.invoiceTotalCny = plan.paidTotalCny = 9800;
+  instance.control.autoSubmit = true;
+  instance.progress = instance.control.progress = {
+    ownedDocument: true, uploadPageId: await browserTargetId(page), uploads: [{
+      state: 'verified', files, proof: { schoolReceipt: { invoiceCount: 2, attachmentCount: 1, invoiceTotalCny: 9800 } },
+    }], submission: { state: 'not_started' }, paymentVerified: true,
+  };
+  await frame.evaluate(({ projectNo, signer, actualPurpose }) => {
+    history.replaceState(null, '', '/ClaimsPublicPCWeb/filling?id=fixture-purpose-limit');
+    document.querySelector('#app').innerHTML = `<p>${projectNo} ${signer.name} ${signer.employeeNo}</p>
+      <section><h2>报销支出费用明细</h2><div class="el-collapse-item"><div class="detail">
+        <input placeholder="请输入金额" value="98.00"><input placeholder="请输入用途" maxlength="${actualPurpose.length}">
+      </div></div><p>待分配金额：￥0.00</p></section>
+      <div class="el-dialog"><h2>确认提交报销单</h2><p>报销金额：98.00</p><button>提交预审</button></div>`;
+    document.querySelector('button').onclick = () => { window.confirmClicks = (window.confirmClicks || 0) + 1; };
+    document.querySelector('[placeholder="请输入用途"]').value = actualPurpose;
+  }, { projectNo: plan.project.projectNo, signer: plan.signer, actualPurpose });
+  const purpose = frame.getByPlaceholder('请输入用途');
+  await purpose.evaluate((field) => field.removeAttribute('maxlength'));
+  await assert.rejects(instance.verifyDetailAmounts(), /用途核验失败/);
+  await purpose.evaluate((field, limit) => { field.maxLength = limit; }, actualPurpose.length);
+  await instance.verifyDetailAmounts();
+  assert.equal(instance.progress.schoolDetailPurpose, actualPurpose);
+  assert.equal(instance.progress.detailVerified, true);
+  instance.ask = async (question, metadata) => {
+    assert.equal(metadata.kind, 'final_approval');
+    assert.ok(question.includes(plan.reason));
+    assert.ok(question.includes(`实际显示「${actualPurpose}」`));
+    return '先别提交';
+  };
+  assert.equal(await instance.confirmAndFinish(), 'preview');
+  instance.ask = async () => {
+    await purpose.fill('修改后的其他用途');
+    return '确认提交';
+  };
+  await assert.rejects(instance.confirmAndFinish(), /用途核验失败/);
+  assert.equal(await frame.evaluate(() => window.confirmClicks || 0), 0);
+});
+
 test('the school receipt verifies this upload without displaying the original filenames', async (t) => {
   const { instance, frame, plan } = await setup(t, 'start');
   const directory = await mkdtemp(join(tmpdir(), 'runner-upload-fixture-'));

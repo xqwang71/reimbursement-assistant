@@ -981,6 +981,11 @@ function resumePending(run, question, answer) {
 
 function pendingAnswer(question, message) {
   const { kind, choices } = question.metadata;
+  if (kind === 'amount_review') {
+    const text = message.normalize('NFKC').replace(/\s|[。！!？?]+$/g, '');
+    return directInstruction(message) === 'resume' || /^(?:请)?(?:(?:你|助手)来?)?(?:重新|再)?核对(?:一下|下|一遍)?(?:金额)?$/.test(text)
+      ? '继续' : undefined;
+  }
   if (!choices) return message;
   const compact = message.normalize('NFKC').replace(/\s/g, '');
   const numbered = choices.find(({ value }) => value === compact);
@@ -992,6 +997,7 @@ function pendingAnswer(question, message) {
 }
 
 function pendingChoiceHint(question) {
+  if (question.metadata.kind === 'amount_review') return question.question;
   return question.metadata.kind === 'project_expense_type'
     ? '请选择本笔的费用科目，也可以回复科目名称或选项编号。'
     : '请从当前学校搜索结果中选择人员，也可以回复选项编号。';
@@ -2189,7 +2195,7 @@ async function route(request, response) {
     const question = pending.get(run.id);
     if (!question) return json(response, 409, { error: '当前没有等待回复的问题' });
     const answer = pendingAnswer(question, message);
-    if (question.metadata.choices && !answer) return json(response, 409, { error: pendingChoiceHint(question) });
+    if (!answer) return json(response, 409, { error: pendingChoiceHint(question) });
     addMessage(run, 'user', message);
     if (question.metadata.kind === 'pause' && /继续|恢复/.test(message)) run.control.paused = false;
     resumePending(run, question, answer);
@@ -2366,7 +2372,7 @@ async function route(request, response) {
         addMessage(run, 'assistant', pendingChoiceHint(question));
       } else if (question) {
         resumePending(run, question, '继续');
-        addMessage(run, 'assistant', '已把你的回复交给当前等待步骤，继续执行。');
+        addMessage(run, 'assistant', questionKind === 'amount_review' ? '正在重新读取学校费用明细和待分配金额。' : '已把你的回复交给当前等待步骤，继续执行。');
       } else {
         if (run.status === 'pausing') run.status = 'running';
         const detail = run.control.waitingForCampusLogin ? '正在等待学校认证。登录完成后会自动继续。'
@@ -2382,8 +2388,13 @@ async function route(request, response) {
       if (isStatusQuestion(message)) await answerWithCodex(run, message);
       else {
         const answer = pendingAnswer(question, message);
-        if (answer) resumePending(run, question, answer);
-        else addMessage(run, 'assistant', pendingChoiceHint(question));
+        if (answer) {
+          if (questionKind === 'amount_review') addMessage(run, 'assistant', '正在重新读取学校费用明细和待分配金额。');
+          resumePending(run, question, answer);
+        } else {
+          addMessage(run, 'assistant', pendingChoiceHint(question));
+          await saveRuns();
+        }
       }
       return json(response, 200, { run: publicRun(run) });
     }
