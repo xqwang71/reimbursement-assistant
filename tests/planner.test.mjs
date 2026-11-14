@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cp, writeFile } from 'node:fs/promises';
+import { cp, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createPlan, validatePlanForExecution } from '../lib/planner.mjs';
 import { confirmClaimPurpose } from '../lib/claim-purpose.mjs';
@@ -99,6 +99,33 @@ test('a successful payment, including a visible discount, determines the claimed
   assert.equal(plan.paidTotalCny, 9000);
   assert.equal(plan.totalCny, 9000);
   assert.equal(plan.rows[0].reimbursementAmountCny, 9000);
+});
+
+test('cached invoice text normalizes spaces within the label, number, amount and date', async (t) => {
+  const input = await cachedFixture(t, { order: null });
+  const cachePath = join(input.appDir, '.runtime', 'cache', encodeURIComponent(input.folder), `${input.fingerprint}.json`);
+  const cache = JSON.parse(await readFile(cachePath, 'utf8'));
+  const invoice = cache.documents.find((item) => item.kind === 'invoice');
+  const number = invoice.invoiceNumber;
+  invoice.text = [
+    '打印日期：2025年1月2日',
+    `发 票\t号　码 ：${number.match(/.{4}/g).join(' ')}`,
+    `订单编号：${invoice.orderNumber}       12345`,
+    '价 税 合 计 （ 小 写 ） ￥ 1 0 0 . 0 0',
+    '开 票 日 期 ：2 0 2 6 年 1 1 月 0 1 日',
+  ].join('\n');
+  invoice.invoiceNumber = null;
+  invoice.invoiceAmountCny = null;
+  await writeFile(cachePath, JSON.stringify(cache));
+
+  const plan = await createPlan(input);
+  assert.equal(plan.cacheState, 'cached');
+  assert.equal(plan.rows.length, 1);
+  assert.equal(plan.rows[0].invoiceNumber, number);
+  assert.equal(plan.rows[0].orderNumber, invoice.orderNumber);
+  assert.equal(plan.rows[0].date, '2026-11-01');
+  assert.equal(plan.invoiceTotalCny, 10000);
+  assert.equal(plan.totalCny, 9000);
 });
 
 test('a payment can establish the amount when the invoice has no matching order', async (t) => {

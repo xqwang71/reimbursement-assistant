@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { requestRoute } from './request-fixture.mjs';
@@ -8,6 +8,7 @@ import { readModelSettings, modelForPurpose, publicModelSettings } from '../lib/
 import { redactModelText } from '../lib/model-input.mjs';
 import { confirmSubmission } from '../lib/submission-confirmation.mjs';
 import { privateDataDirectory, profileId } from '../lib/platform.mjs';
+import { listWorkspaces, resolveWorkspace } from '../lib/workspaces.mjs';
 
 test('fresh installation serves the synthetic workbooks and blocks live operations in demo mode', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'reimbursement-community-'));
@@ -75,6 +76,31 @@ test('local data paths cannot resolve into the program, even through a directory
   await mkdir(data);
   await symlink(program, join(data, '.runtime'), process.platform === 'win32' ? 'junction' : 'dir');
   await assert.rejects(profile(data), /用户数据目录/);
+});
+
+test('annual receipt folders are separate from each owner’s runtime and the public examples', async (t) => {
+  const program = await realpath(await mkdtemp(join(tmpdir(), 'reimbursement-workspaces-')));
+  t.after(() => rm(program, { recursive: true, force: true }));
+  await Promise.all(['2026', '2027', '2099'].map((year) => mkdir(join(program, 'examples', year), { recursive: true })));
+
+  const first = await resolveWorkspace(program, { owner: 'Example A', year: '2026', create: true });
+  const next = await resolveWorkspace(program, { owner: 'Example A', year: '2027', create: true });
+  const other = await resolveWorkspace(program, { owner: 'Example B', year: '2026', create: true });
+  const demo = await resolveWorkspace(program, { owner: '示例', year: '2027' });
+
+  assert.equal(first.dataDirectory, next.dataDirectory);
+  assert.equal(first.sourceRoot, join(program, 'owner', 'Example A', '2026'));
+  assert.equal(next.sourceRoot, join(program, 'owner', 'Example A', '2027'));
+  assert.notEqual(other.dataDirectory, first.dataDirectory);
+  assert.notEqual(demo.dataDirectory, first.dataDirectory);
+  assert.equal(demo.sourceRoot, join(program, 'examples', '2027'));
+  assert.deepEqual(await listWorkspaces(program), [
+    { name: '示例', years: ['2026', '2027'], example: true },
+    { name: 'Example A', years: ['2026', '2027'] },
+    { name: 'Example B', years: ['2026'] },
+  ]);
+  await symlink(first.sourceRoot, join(other.dataDirectory, '2027'), process.platform === 'win32' ? 'junction' : 'dir');
+  await assert.rejects(resolveWorkspace(program, { owner: 'Example B', year: '2027' }), /普通文件夹/);
 });
 
 test('external models start disabled even when an API key exists in the environment', async () => {

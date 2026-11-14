@@ -1,4 +1,4 @@
-export function bindFundingSummary({ api, money, escapeHtml, onPayrollSync }) {
+export function bindFundingSummary({ api, money, escapeHtml, onPayrollSync, currentYear }) {
   const field = (id) => document.getElementById(id);
   const status = field('fundingStatus');
   const refresh = field('fundingRefresh');
@@ -147,6 +147,11 @@ export function bindFundingSummary({ api, money, escapeHtml, onPayrollSync }) {
     const newRoot = summary?.sourceRoot !== result.sourceRoot;
     const opened = new Set(summary?.sourceRoot === result.sourceRoot ? [...projects.querySelectorAll('[data-funding-project][open]')].map((node) => node.dataset.fundingProject) : []);
     summary = result;
+    const year = currentYear();
+    const yearQuery = year ? `&year=${encodeURIComponent(year)}` : '';
+    for (const link of field('fundingData').querySelectorAll('[data-funding-export]')) {
+      link.href = `/api/funding-summary?export=${link.dataset.fundingExport}${yearQuery}`;
+    }
     const { totals } = result;
     const latestSchoolDate = result.sources.filter(({ kind }) => kind !== 'runner').map(({ lastDate }) => lastDate || '').sort().at(-1);
     field('fundingPeriod').textContent = [result.demoMode ? '虚构示例' : '', result.year ? `${result.year} 年度` : '当前票据目录', latestSchoolDate ? `学校表最晚记录 ${latestSchoolDate}` : ''].filter(Boolean).join(' · ');
@@ -178,7 +183,7 @@ export function bindFundingSummary({ api, money, escapeHtml, onPayrollSync }) {
         : source.state === 'missing' ? '未在年度票据目录找到' : source.message;
       const downloadable = ['smart', 'legacy', 'labor'].includes(source.kind) || (result.demoMode && source.kind === 'budget');
       const link = source.state === 'read' && downloadable
-        ? `　<a href="/api/funding-summary/source?file=${encodeURIComponent(source.file)}" download>${source.kind === 'budget' ? '下载台账模板' : result.demoMode ? '下载示例 Excel' : '下载原始 Excel'}</a>` : '';
+        ? `　<a href="/api/funding-summary/source?file=${encodeURIComponent(source.file)}${yearQuery}" download>${source.kind === 'budget' ? '下载台账模板' : result.demoMode ? '下载示例 Excel' : '下载原始 Excel'}</a>` : '';
       return `<li><strong>${escapeHtml(source.file)}</strong>　${escapeHtml(info)}${link}</li>`;
     }).join('');
     field('fundingContent').hidden = false;

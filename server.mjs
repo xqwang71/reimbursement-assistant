@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { readFile, writeFile, mkdir, rename, readdir, lstat, realpath } from 'node:fs/promises';
-import { join, resolve, dirname, extname, posix } from 'node:path';
+import { basename, join, resolve, dirname, extname, posix } from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
@@ -13,7 +13,7 @@ import { executeRunWithRecovery } from './lib/execution-recovery.mjs';
 import { didiBudgetCny, validateDidiSelection } from './lib/didi-invoices.mjs';
 import { normalizeModelSettings, publicModelSettings, readModelSettings } from './lib/model-settings.mjs';
 import { fundingSummaryCsv, readFundingExports, readPayrollPeople, summarizeFunding } from './lib/funding-summary.mjs';
-import { DEFAULT_PORT, isInsideDirectory, privateDataDirectory, profileId, receiptDirectory } from './lib/platform.mjs';
+import { DEFAULT_PORT, isInsideDirectory, privateDataDirectory, profileId, receiptDirectory, serviceRevision } from './lib/platform.mjs';
 import { DEFAULT_PREFERENCES, localPreferences, localSigner, projectFunding } from './lib/local-settings.mjs';
 import { createSchoolFundingSync } from './lib/school-funding-sync.mjs';
 import { checkSchoolFinancePage } from './lib/school-finance-access.mjs';
@@ -32,16 +32,22 @@ import { readSchoolPayrollStates } from './lib/school-payroll-status.mjs';
 import { searchSchoolStudents, STUDENT_PAYROLL } from './lib/school-payroll-people.mjs';
 import { saveAppointmentPdf } from './lib/school-appointment-pdf.mjs';
 import { hasReviewArchive, listArchivedBatches, readArchivedBatch, reviewArchivePath } from './lib/review-archive.mjs';
+import { answerWorkspaceRequests, isWorkspaceYear, listWorkspaces, publicWorkspace, requestWorkspaceProcess, resolveWorkspace } from './lib/workspaces.mjs';
 
 const APP_DIR = await realpath(fileURLToPath(new URL('.', import.meta.url)));
+const SERVICE_REVISION = await serviceRevision(APP_DIR);
 const PUBLIC_DIR = join(APP_DIR, 'public');
+let workspace = process.send && process.env.REIMBURSEMENT_WORKSPACE
+  ? await resolveWorkspace(APP_DIR, JSON.parse(process.env.REIMBURSEMENT_WORKSPACE)) : null;
+const workspaceAtLaunch = workspace;
 const EXAMPLE_ROOT = join(APP_DIR, 'examples', '2099');
-const DATA_APP_DIR = await privateDataDirectory(APP_DIR);
+const DATA_APP_DIR = await privateDataDirectory(APP_DIR, process.env, workspace);
 const PROFILE_ID = profileId(DATA_APP_DIR);
 const RUNTIME_DIR = join(DATA_APP_DIR, '.runtime');
 const REVIEW_ARCHIVE_FILE = reviewArchivePath(RUNTIME_DIR);
-const DEFAULT_SOURCE_ROOT = await receiptDirectory(resolve(process.env.REIMBURSEMENT_SOURCE_ROOT || join(DATA_APP_DIR, '票据')), APP_DIR, DATA_APP_DIR);
-const DEFAULT_DEMO = !process.env.REIMBURSEMENT_SOURCE_ROOT;
+const DEFAULT_SOURCE_ROOT = workspace ? workspace.sourceRoot
+  : await receiptDirectory(resolve(process.env.REIMBURSEMENT_SOURCE_ROOT || join(DATA_APP_DIR, '票据')), APP_DIR, DATA_APP_DIR);
+const DEFAULT_DEMO = workspace?.example ?? !process.env.REIMBURSEMENT_SOURCE_ROOT;
 const RUNS_FILE = join(RUNTIME_DIR, 'runs.json');
 const BATCHES_FILE = join(RUNTIME_DIR, 'batches.json');
 const HISTORY_FILE = join(RUNTIME_DIR, 'history.json');
@@ -56,9 +62,8 @@ const CONFIG_FILE = join(RUNTIME_DIR, 'config.json');
 const MODEL_CONFIG_FILE = join(RUNTIME_DIR, 'model-config.json');
 const FUNDING_ATTRIBUTIONS_FILE = join(RUNTIME_DIR, 'funding-attributions.json');
 let demoMode = DEFAULT_DEMO;
-let SOURCE_ROOT = demoMode ? EXAMPLE_ROOT : DEFAULT_SOURCE_ROOT;
+let SOURCE_ROOT = workspace?.sourceRoot ?? (demoMode ? EXAMPLE_ROOT : DEFAULT_SOURCE_ROOT);
 let liveSourceRoot = DEFAULT_SOURCE_ROOT;
-if (!demoMode) SOURCE_ROOT = liveSourceRoot;
 let preferences = DEFAULT_PREFERENCES;
 const schoolFundingSync = createSchoolFundingSync({
   appDir: DATA_APP_DIR, runtimeDir: RUNTIME_DIR, currentRoot: () => SOURCE_ROOT, syncPayrollStatuses: refreshSchoolPayrollStatuses,
@@ -129,9 +134,11 @@ const savedConfig = await readFile(CONFIG_FILE, 'utf8').then(JSON.parse, (error)
   throw error;
 });
 if (savedConfig) {
-  demoMode = typeof savedConfig.demoMode === 'boolean' ? savedConfig.demoMode : !savedConfig.sourceRoot && DEFAULT_DEMO;
-  liveSourceRoot = await receiptDirectory(resolve(savedConfig.liveSourceRoot || savedConfig.sourceRoot || DEFAULT_SOURCE_ROOT), APP_DIR, DATA_APP_DIR);
-  SOURCE_ROOT = demoMode ? EXAMPLE_ROOT : liveSourceRoot;
+  if (!workspace) {
+    demoMode = typeof savedConfig.demoMode === 'boolean' ? savedConfig.demoMode : !savedConfig.sourceRoot && DEFAULT_DEMO;
+    liveSourceRoot = await receiptDirectory(resolve(savedConfig.liveSourceRoot || savedConfig.sourceRoot || DEFAULT_SOURCE_ROOT), APP_DIR, DATA_APP_DIR);
+    SOURCE_ROOT = demoMode ? EXAMPLE_ROOT : liveSourceRoot;
+  }
   preferences = localPreferences(savedConfig.preferences);
   if (/^\d{4}$/.test(savedConfig.paymentCardLast4 || '')) paymentCardLast4 = savedConfig.paymentCardLast4;
   if (typeof savedConfig.configurationRevision === 'string' && savedConfig.configurationRevision) configurationRevision = savedConfig.configurationRevision;
@@ -146,7 +153,7 @@ try {
         importedReasons = true;
       }
     }
-    if (!plan?.id || plan.version !== PLAN_VERSION || plan.sourceRoot !== SOURCE_ROOT || plan.configurationRevision !== configurationRevision) continue;
+    if (!plan?.id || plan.version !== PLAN_VERSION || (!workspace && plan.sourceRoot !== SOURCE_ROOT) || plan.configurationRevision !== configurationRevision) continue;
     applyMemoryToPlan(plan);
     plans.set(plan.id, plan);
   }
@@ -245,6 +252,13 @@ function hasUnresolvedEffect(run) {
     progress?.uploads?.some((operation) => operation.state === 'started'));
 }
 
+function canResumeSmartPreview(run) {
+  const { progress, cancelled } = run.control;
+  return run.status === 'preview' && run.plan.reimbursementRoute === 'smart' && !run.resolved && !cancelled &&
+    progress.ownedDocument && Boolean(progress.uploadPageId && (progress.fillingId || progress.documentId)) &&
+    progress.submission.state === 'not_started' && !hasUnresolvedEffect(run);
+}
+
 function schoolReceiptOnly(run) {
   const { progress } = run.control;
   return ['legacy', 'labor'].includes(run.plan.reimbursementRoute) &&
@@ -288,7 +302,7 @@ function validatePlanContext(plan) {
   const planned = plan.projectAllocationDraft ?? matchProjects(plan.project);
   if (planned.some((project) => catalogProject(project).projectName !== project.projectName)) throw httpError(409, '项目清单名称已更新，请重新核对报销事项');
   const group = claimGroupFor(plan.sourceRoot, plan.folder);
-  const subject = memory.subjectByFolder?.[plan.folder] || group?.subject;
+  const subject = memory.subjectByFolder?.[folderMemoryKey(plan.sourceRoot, plan.folder)] || group?.subject;
   if (subject && subject !== plan.subject) throw httpError(409, '报销科目已变化，请重新核对办理系统');
   if (plan.groupId && (!group || group.status !== 'draft' || !isDeepStrictEqual(group.folders, plan.sourceFolders))) throw httpError(409, '报销事项的来源文件夹已变化，请重新检查');
   if (!plan.groupId && [...claimGroups.values()].some((item) => item.sourceRoot === plan.sourceRoot && item.status !== 'dissolved' && item.folders.includes(plan.folder))) throw httpError(409, '该文件夹已加入报销事项，请从报销事项执行');
@@ -331,6 +345,7 @@ function normalizeProjectMatch(match) {
 }
 
 function projectMatchKey(root, folder) { return `${root}\0${folder}`; }
+function folderMemoryKey(root, folder) { return workspace ? projectMatchKey(root, folder) : folder; }
 
 function claimGroupFor(root, key) {
   const group = claimGroups.get(key);
@@ -814,9 +829,25 @@ function json(response, status, value) {
 }
 
 async function publicConfig() {
-  return { demoMode, sourceRoot: liveSourceRoot, defaultSourceRoot: DEFAULT_SOURCE_ROOT,
+  return { demoMode, sourceRoot: liveSourceRoot, defaultSourceRoot: workspace?.sourceRoot ?? DEFAULT_SOURCE_ROOT, workspace: publicWorkspace(workspace),
     paymentCardConfigured: Boolean(paymentCardLast4), preferences,
     reviewArchiveAvailable: !demoMode && await hasReviewArchive(REVIEW_ARCHIVE_FILE).catch(() => false) };
+}
+
+function selectWorkspaceYear(selection) {
+  return withWorklistWrite(async () => {
+    const next = await resolveWorkspace(APP_DIR, selection);
+    if (next.dataDirectory !== DATA_APP_DIR) throw new Error('请选择当前使用人的年度。');
+    if (next.sourceRoot === SOURCE_ROOT) return publicWorkspace(workspace);
+    if (browserReservation || [...runs.values()].some((run) => ACTIVE_RUN_STATUSES.has(run.status)) || schoolFundingSync.view(SOURCE_ROOT)?.active) {
+      throw new Error('当前年度还有正在执行或同步的操作，结束后再切换。');
+    }
+    await atomicJson(CONFIG_FILE, { demoMode, sourceRoot: demoMode ? '' : next.sourceRoot, liveSourceRoot: next.sourceRoot,
+      preferences, paymentCardLast4, configurationRevision });
+    workspace = next;
+    SOURCE_ROOT = liveSourceRoot = next.sourceRoot;
+    return publicWorkspace(workspace);
+  });
 }
 
 async function body(request) {
@@ -836,8 +867,10 @@ function publicRun(run) {
   const submission = run.control.progress.submission;
   const question = pending.get(run.id);
   const draftNumber = run.control.progress.payroll?.financeFormId || booking?.pdfFinanceFormId;
+  const year = workspace ? basename(run.sourceRoot) : null;
   return {
     id: run.id,
+    ...(isWorkspaceYear(year) ? { year } : {}),
     plan: publicPlan(run.plan),
     status: run.status,
     result: run.result,
@@ -847,6 +880,9 @@ function publicRun(run) {
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
     needsVerification: run.status === 'verification_required',
+    canResumePreview: canResumeSmartPreview(run),
+    canEndDraft: ['preview', 'verification_required', 'error'].includes(run.status) &&
+      submission.state !== 'verified' && holdsDocument(run),
     pendingQuestion: question?.question || null,
     pendingKind: question?.metadata.kind || null,
     ...(question?.metadata.choices ? { pendingChoices: question.metadata.choices } : {}),
@@ -1268,8 +1304,31 @@ async function route(request, response) {
   }
   if (isApi && !['GET', 'HEAD'].includes(request.method) &&
       request.headers['content-type']?.split(';')[0].trim() !== 'application/json') throw httpError(415, '请从本机报销助手页面操作。');
+  const requestYear = request.headers['x-reimbursement-year'] || url.searchParams.get('year');
+  if (isApi && workspace && requestYear && requestYear !== workspace.year &&
+      url.pathname !== '/api/workspaces') {
+    throw httpError(409, '当前年度已切换，请刷新页面后再操作。');
+  }
+  if (workspace && request.method === 'POST') {
+    const action = url.pathname.match(/^\/api\/runs\/([0-9a-f-]+)\/(?:resolution|instructions|replies|withdrawal)$/);
+    const run = action && runs.get(action[1]);
+    if (run && run.sourceRoot !== SOURCE_ROOT) throw httpError(409, '请切回这笔任务所属的年度后再操作。');
+  }
   if (request.method === 'GET' && url.pathname === '/api/health') {
-    return json(response, 200, { ok: true, edition: 'community', planVersion: PLAN_VERSION, profile: PROFILE_ID });
+    return json(response, 200, { ok: true, edition: 'community', planVersion: PLAN_VERSION, profile: PROFILE_ID,
+      program: profileId(APP_DIR), revision: SERVICE_REVISION, workspaceManaged: Boolean(workspace) && process.connected });
+  }
+  if (url.pathname === '/api/workspaces') {
+    if (!workspace || !process.connected) throw httpError(404, '请从「打开报销助手」启动后选择使用人与年度。');
+    if (request.method === 'GET') return json(response, 200, { current: publicWorkspace(workspace), owners: await listWorkspaces(APP_DIR) });
+    if (request.method === 'POST') {
+      const input = await body(request);
+      const allowCreate = input?.create === true;
+      try {
+        return json(response, 200, await requestWorkspaceProcess(process, 'open', { owner: input?.owner, year: input?.year, create: allowCreate }));
+      } catch (error) { throw httpError(409, error.message); }
+    }
+    throw httpError(405, '请从使用人与年度菜单操作。');
   }
   if (demoMode && url.pathname.startsWith('/api/') && !['/api/config', '/api/model-settings'].includes(url.pathname) &&
       (request.method !== 'GET' || !['/api/funding-summary', '/api/funding-summary/source',
@@ -1321,12 +1380,15 @@ async function route(request, response) {
   if (request.method === 'POST' && url.pathname === '/api/config') {
     return withBrowserReservation(() => withWorklistWrite(async () => {
       const input = await body(request);
+      if (workspace && (workspace.example || input.demoMode === true || String(input.sourceRoot || '').trim() !== workspace.sourceRoot)) {
+        throw httpError(409, '请从页面上方选择使用人和年度。');
+      }
       const nextDemo = input.demoMode === true;
       let nextRoot = EXAMPLE_ROOT;
       if (!nextDemo) {
         if (!String(input.sourceRoot || '').trim()) throw httpError(400, '请填写票据根目录');
         const requestedRoot = resolve(String(input.sourceRoot).trim().replace(/^"(.*)"$/, '$1'));
-        try { nextRoot = await receiptDirectory(requestedRoot, APP_DIR, DATA_APP_DIR); }
+        try { nextRoot = await receiptDirectory(requestedRoot, APP_DIR, DATA_APP_DIR, workspace); }
         catch (error) { throw httpError(400, error.message); }
         if (nextRoot === DEFAULT_SOURCE_ROOT && !process.env.REIMBURSEMENT_SOURCE_ROOT) await mkdir(nextRoot, { recursive: true, mode: 0o700 });
         if (!await readdir(nextRoot).catch(() => null)) throw httpError(400, '票据目录不存在或不可读');
@@ -1355,13 +1417,14 @@ async function route(request, response) {
     if (request.method !== 'GET') throw httpError(405, '旧审核档案供查阅。');
     const id = url.searchParams.get('batch');
     if (id !== null && (!id || id.length > 128)) throw httpError(400, '旧批次编号格式有误。');
-    const archive = await (id === null ? listArchivedBatches(REVIEW_ARCHIVE_FILE) : readArchivedBatch(REVIEW_ARCHIVE_FILE, id))
+    const year = workspace ? Number(workspace.year) : null;
+    const archive = await (id === null ? listArchivedBatches(REVIEW_ARCHIVE_FILE, year) : readArchivedBatch(REVIEW_ARCHIVE_FILE, id, year))
       .catch(() => { throw httpError(500, '无法读取旧审核档案，请核对导入的数据库。'); });
     if (!archive) throw httpError(404, id === null ? '当前用户资料没有旧审核档案。' : '找不到旧审核批次。');
     return json(response, 200, archive);
   }
   if (request.method === 'GET' && url.pathname === '/api/folders') {
-    if (demoMode) return json(response, 200, { sourceRoot: EXAMPLE_ROOT, folders: [], claims: [], signerNames: [], payrollCategories: [], payrollPositions: [], payrollExpenseItems: [], payrollSignerNames: {} });
+    if (demoMode) return json(response, 200, { sourceRoot: SOURCE_ROOT, folders: [], claims: [], signerNames: [], payrollCategories: [], payrollPositions: [], payrollExpenseItems: [], payrollSignerNames: {} });
     const sourceRoot = SOURCE_ROOT;
     const appointments = schoolBookingsFor(sourceRoot);
     const bySource = new Map(appointments.flatMap((run) => (run.plan.sourceFolders || [run.plan.folder]).map((folder) => [folder, run])));
@@ -1386,7 +1449,7 @@ async function route(request, response) {
           ? { ...group.submission, schoolStatus: receiptRun.schoolPayrollStatus.label } : group.submission;
       return {
         path: group.key, groupId: group.id, label: group.status === 'submitted' ? (group.reason?.draft || group.name) : group.name, sourceFolders: group.folders,
-        subject: group.status === 'draft' ? memory.subjectByFolder?.[group.key] || group.subject : group.subject,
+        subject: group.status === 'draft' ? memory.subjectByFolder?.[folderMemoryKey(sourceRoot, group.key)] || group.subject : group.subject,
         fileCount: group.folders.reduce((total, folder) => total + (folders.find((item) => item.path === folder)?.fileCount || 0), 0) || group.fileCount,
         match: group.match, reasonDraft: group.reason?.draft || '', reasonSaved: group.reason?.savedOnce === true,
         offlineBooking: bookingOptionsFor(sourceRoot, group.key)?.offline === true,
@@ -1416,7 +1479,7 @@ async function route(request, response) {
       const key = projectMatchKey(sourceRoot, folder.path);
       const reason = claimReasons.get(key);
       const group = claimed.get(folder.path);
-      return { ...folder, subject: memory.subjectByFolder?.[folder.path], claimKey: group?.key, claimLabel: group?.name, match: projectMatches.get(key), reasonDraft: reason?.draft, reasonSaved: reason?.savedOnce === true };
+      return { ...folder, subject: memory.subjectByFolder?.[folderMemoryKey(sourceRoot, folder.path)], claimKey: group?.key, claimLabel: group?.name, match: projectMatches.get(key), reasonDraft: reason?.draft, reasonSaved: reason?.savedOnce === true };
     }) });
   }
   if (request.method === 'GET' && url.pathname === '/api/payroll-people') {
@@ -1576,7 +1639,7 @@ async function route(request, response) {
       const id = randomUUID();
       const key = `@事项/${id}`;
       const first = merging[0];
-      const subject = memory.subjectByFolder?.[first?.key || folders[0]] || first?.subject || input.subject || '其他';
+      const subject = memory.subjectByFolder?.[folderMemoryKey(SOURCE_ROOT, first?.key || folders[0])] || first?.subject || input.subject || '其他';
       if (!Object.hasOwn(SUBJECTS, subject)) throw httpError(400, '请选择有效的报销科目');
       const booking = bookingOptionsForRoute(input.reimbursementRoute === undefined ? 'smart' : input.reimbursementRoute, subject);
       const group = { id, key, sourceRoot: SOURCE_ROOT, folders, name: folders.map((folder) => folder.split('/').at(-1)).join('、'), subject, match: commonMatch, reason: commonReason, bookingOptions: booking, status: 'draft', fileCount: folders.reduce((n, folder) => n + available.find((item) => item.path === folder).fileCount, 0), mergedFrom: [...mergedKeys], createdAt: new Date().toISOString() };
@@ -1604,7 +1667,7 @@ async function route(request, response) {
       if (undo) updated = { ...group, status: 'dissolved' };
       else if (request.method === 'PATCH') {
         const previous = bookingOptionsFor(group.sourceRoot, group.key);
-        const subject = memory.subjectByFolder?.[group.key] || group.subject;
+        const subject = memory.subjectByFolder?.[folderMemoryKey(group.sourceRoot, group.key)] || group.subject;
         const booking = bookingOptionsForRoute(input.reimbursementRoute, subject, previous);
         if (isDeepStrictEqual(booking, previous)) return json(response, 200, { group: { ...group, bookingOptions: previous } });
         updated = { ...group, bookingOptions: booking };
@@ -1728,8 +1791,9 @@ async function route(request, response) {
     if (group?.payroll) throw httpError(400, '请从薪酬申报表打开本笔事项');
     if (group?.didi) throw httpError(400, '贸大出行的票据在执行时从学校票夹选取');
     if (input.folder.startsWith('@事项/') && !group) throw httpError(404, '报销事项不存在');
-    const subject = memory.subjectByFolder?.[input.folder] || group?.subject || input.subject;
-    const travelProfile = input.travelProfile || memory.travelProfileByFolder?.[input.folder] || (subject === '差旅' ? DEFAULT_TRAVEL_PROFILE : null);
+    const memoryKey = folderMemoryKey(SOURCE_ROOT, input.folder);
+    const subject = memory.subjectByFolder?.[memoryKey] || group?.subject || input.subject;
+    const travelProfile = input.travelProfile || memory.travelProfileByFolder?.[memoryKey] || (subject === '差旅' ? DEFAULT_TRAVEL_PROFILE : null);
     const sourceRoot = SOURCE_ROOT;
     const revision = configurationRevision;
     return withPlanOperation(sourceRoot, input.folder, async () => {
@@ -1744,7 +1808,7 @@ async function route(request, response) {
       if (match !== projectMatchFor(sourceRoot, input.folder)) throw httpError(409, '经费匹配已变化，请重新检查文件夹');
       if (savedBooking !== bookingOptionsFor(sourceRoot, input.folder)) throw httpError(409, '办理方式或纸质附件张数已变化，请重新检查事项');
       if (group && (!claimGroupFor(sourceRoot, input.folder) || claimGroupFor(sourceRoot, input.folder).status !== 'draft' || !isDeepStrictEqual(group.folders, claimGroupFor(sourceRoot, input.folder).folders))) throw httpError(409, '事项来源已变化，请重新检查');
-      if (memory.subjectByFolder?.[input.folder] && memory.subjectByFolder[input.folder] !== subject) throw httpError(409, '报销科目已变化，请重新核对办理系统');
+      if (memory.subjectByFolder?.[memoryKey] && memory.subjectByFolder[memoryKey] !== subject) throw httpError(409, '报销科目已变化，请重新核对办理系统');
       const reason = group && claimReasonFor(sourceRoot, input.folder);
       if (reason?.savedOnce && reason.fingerprint === plan.fingerprint && reason.draft && project?.projectNo && project?.projectName) {
         plan = confirmClaimPurpose(plan, { reason: reason.draft, confirmed: true });
@@ -1879,6 +1943,7 @@ async function route(request, response) {
       const travelProfile = input.travelProfile?.role ? { role: input.travelProfile.role, fundType: input.travelProfile.fundType === 'research' ? 'research' : 'budget' } : null;
       const changes = await rememberPlanEdit(DATA_APP_DIR, memory, {
         folder,
+        folderKey: folderMemoryKey(sourceRoot, folder),
         subject: input.subject,
         expenseType: input.expenseType,
         travelProfile,
@@ -1901,7 +1966,8 @@ async function route(request, response) {
     }));
   }
   if (request.method === 'GET' && url.pathname === '/api/batches') {
-    return json(response, 200, { batches: demoMode ? [] : [...batches.values()].map(publicBatch) });
+    const visible = [...batches.values()].filter((batch) => !workspace || batch.runIds.some((id) => runs.get(id)?.sourceRoot === SOURCE_ROOT));
+    return json(response, 200, { batches: demoMode ? [] : visible.map(publicBatch) });
   }
   const batchMatch = url.pathname.match(/^\/api\/batches\/([0-9a-f-]+)$/);
   if (request.method === 'GET' && batchMatch) {
@@ -1963,7 +2029,10 @@ async function route(request, response) {
     return json(response, 202, { batch: publicBatch(batch) });
   }
   if (request.method === 'GET' && url.pathname === '/api/runs') {
-    return json(response, 200, { runs: demoMode ? [] : [...runs.values()].map(publicRun) });
+    const blocking = heldRun();
+    return json(response, 200, demoMode ? { runs: [], blockingRunId: null }
+      : { runs: [...runs.values()].filter((run) => !workspace || run.sourceRoot === SOURCE_ROOT || run === blocking).map(publicRun),
+        blockingRunId: blocking?.id || null });
   }
   if (request.method === 'POST' && url.pathname === '/api/runs') {
     const input = await body(request);
@@ -2012,7 +2081,9 @@ async function route(request, response) {
     const run = runs.get(resolutionMatch[1]);
     if (!run || !['verification_required', 'preview', 'error'].includes(run.status)) return json(response, 409, { error: '当前任务不等待核实' });
     const input = await body(request);
-    if (resolvingRuns.has(run.id) || !['verification_required', 'preview', 'error'].includes(run.status)) throw httpError(409, '本任务的核实结果已在处理中，请刷新后查看');
+    if (resolvingRuns.has(run.id) || browserReservation === run.id || !['verification_required', 'preview', 'error'].includes(run.status)) {
+      throw httpError(409, '本任务正在处理，请刷新后查看。');
+    }
     resolvingRuns.add(run.id);
     try {
       if (input.confirmed !== true) throw httpError(400, '请先核实学校系统中的本笔单据状态');
@@ -2041,10 +2112,18 @@ async function route(request, response) {
         run.status = uncertainUpload ? 'verification_required' : 'error';
         run.error = uncertainUpload ? '已确认未提交，但附件上传结果仍待核实；请在学校系统中作废或删除该草稿后，再登记“已作废/删除草稿”' : '用户已核实未提交；重试前仍会核对当前附件和草稿';
       } else if (input.resolution === 'abandon_draft') {
+        if (run.control.progress.submission.state === 'verified') throw httpError(409, '本笔已核实提交，请从「已办理」登记撤回。');
         run.resolved = true;
         run.control.cancelled = true;
         run.status = 'abandoned';
+        run.error = null;
         addMessage(run, 'assistant', '已记录你在学校系统作废或删除了该草稿并核实未提交，本任务结束。');
+        const batch = [...batches.values()].find((item) => item.currentRunId === run.id);
+        if (batch) {
+          batch.status = 'abandoned';
+          batch.error = null;
+          batch.updatedAt = run.updatedAt;
+        }
       } else throw httpError(400, '请选择本次已核实的单据结果');
       await saveRuns();
       return json(response, 200, { run: publicRun(run) });
@@ -2133,12 +2212,14 @@ async function route(request, response) {
     const resumeSubmission = wantsResume && run.status === 'verification_required' && !run.resolved && progress.uploadPageId &&
       ['attempted', 'verification_required'].includes(progress.submission.state) && progress.submission.fingerprint === run.plan.fingerprint;
     const resumeLogin = (wantsResume || wantsRetry) && canResumeCampusLogin(run);
+    const resumePreview = wantsResume && canResumeSmartPreview(run);
     const resumeSamePage = wantsResume && run.status === 'error' && !run.resolved && !run.control.cancelled &&
       (progress.uploadPageId || run.control.portalPageId) && !hasUnresolvedEffect(run);
     if (wantsRetry && !resumeSchool && (run.status === 'verification_required' || hasUnresolvedEffect(run) || progress.submission.state === 'verified')) {
       return json(response, 409, { error: '学校结果待核实。回复「继续」可核对原单。' });
     }
-    if (resumeSchool || resumeLogin || resumeUpload || resumeSubmission || resumeSamePage || (wantsRetry && run.status === 'error')) {
+    if (resumeSchool || resumeLogin || resumeUpload || resumeSubmission || resumeSamePage || resumePreview || (wantsRetry && run.status === 'error')) {
+      if (resolvingRuns.has(run.id)) throw httpError(409, '本任务的核实结果正在保存，请稍后查看。');
       reserveBrowser(run.id, run.id);
       if (!resumeSchool || !schoolReceiptOnly(run)) {
         await validateRun(run).catch((error) => { releaseBrowser(run.id); throw httpError(409, error.message); });
@@ -2150,15 +2231,18 @@ async function route(request, response) {
       run.control.cancelled = false;
       if (resumeSchool) run.control.payrollRecoveryAttempts = 0;
       if (resumeSchool && compact === '确认提交') run.control.skipSubmit = false;
+      if (resumePreview) run.control.skipSubmit = false;
       run.control.resumeStages = !resumeLogin;
       run.control.autoSubmit = false;
       run.resolved = false;
       addMessage(run, 'assistant', resumeUpload
         ? '正在接回原报销单并核对已上传票据，核对通过后从当前步骤继续。'
         : resumeSubmission ? '正在读取原单的学校提交回执。'
+        : resumePreview ? '正在接回原草稿。请核对后再确认是否提交。'
         : resumeLogin ? '正在原报销标签检查学校登录，认证后继续当前批次。' : '已从当前网页状态重试，已完成的阶段会自动跳过。');
       const batch = [...batches.values()].find((item) =>
-        item.currentRunId === run.id && (['verification_required', 'error', 'interrupted'].includes(item.status) || resumeSchool && item.status === 'preview'));
+        item.currentRunId === run.id && (['verification_required', 'error', 'interrupted'].includes(item.status) ||
+          (resumeSchool || resumePreview) && item.status === 'preview'));
       if (batch) {
         for (const id of batch.runIds.slice(batch.currentIndex + 1)) {
           const queued = runs.get(id);
@@ -2272,12 +2356,16 @@ async function route(request, response) {
     const answer = await answerWithCodex(run, String(input.message || ''));
     return json(response, 200, { answer, run: run ? publicRun(run) : null });
   }
-  if (request.method === 'GET') {
+  if (request.method === 'GET' && !isApi) {
     const requested = url.pathname === '/' ? 'index.html' : posix.normalize(url.pathname).replace(/^\/+/, '');
     const path = resolve(PUBLIC_DIR, requested);
     if (!isInsideDirectory(PUBLIC_DIR, path)) return json(response, 403, { error: '禁止访问' });
     const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' }[extname(path)] || 'application/octet-stream';
-    const content = await readFile(path);
+    const content = await readFile(path).catch((error) => {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR' || error.code === 'EISDIR') return null;
+      throw error;
+    });
+    if (content === null) return json(response, 404, { error: '找不到页面资源' });
     response.writeHead(200, { 'content-type': mime, 'cache-control': 'no-store' });
     return response.end(content);
   }
@@ -2308,7 +2396,19 @@ export function handleRequest(request, response) {
 
 if (process.argv[1] && await realpath(resolve(process.argv[1])).catch(() => null) === fileURLToPath(import.meta.url)) {
   const server = http.createServer(handleRequest);
-  server.on('error', (error) => { console.error('无法启动本机服务。' + error.code); process.exitCode = 1; });
+  const listening = new Promise((ready, reject) => {
+    server.once('listening', () => ready({ port: server.address().port }));
+    server.once('error', reject);
+  });
+  if (process.send) {
+    answerWorkspaceRequests(process, 'ready', () => listening);
+    if (workspaceAtLaunch) answerWorkspaceRequests(process, 'year', selectWorkspaceYear);
+    process.once('disconnect', () => server.close(() => process.exit(0)));
+  }
+  listening.catch((error) => {
+    console.error('无法启动本机服务。' + error.code);
+    if (!process.send) process.exitCode = 1;
+  });
   server.listen(PORT, '127.0.0.1', () => {
     console.log(`报销助手开源版：http://127.0.0.1:${server.address().port}`);
   });

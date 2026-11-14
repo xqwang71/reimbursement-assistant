@@ -65,10 +65,24 @@ async function setup(t, options = {}) {
   }
   const started = join(input.appDir, '.runtime/fake-browser-started');
   const loginReady = join(input.appDir, '.runtime/login-ready');
+  const previewExecution = `
+    const originalTarget = 'test-original-school-tab';
+    if (this.control.progress.uploadPageId) {
+      if (!this.resumeStages || this.control.progress.uploadPageId !== originalTarget ||
+          this.control.progress.fillingId !== 'test-original-draft' || this.control.skipSubmit || this.control.autoSubmit) {
+        throw Error('须从原草稿接回，并等待确认');
+      }
+    } else {
+      this.control.progress.uploadPageId = originalTarget;
+      this.control.progress.fillingId = 'test-original-draft';
+      await this.onProgress();
+    }
+    await this.ask('核对模拟草稿后再确认提交', { kind: 'final_approval' });
+    return 'preview';`;
   await writeFile(join(code, 'lib/executor.mjs'), `import {access, writeFile} from 'node:fs/promises';
 export class ReimbursementExecutor {
 constructor(options){Object.assign(this,options);}
-async run(){${options.requireLogin ? `await access(${JSON.stringify(loginReady)}).catch(()=>{throw new Error('未找到学校财务首页的“智能网报5.0”。请检查专用浏览器的校园网登录状态。');});` : ''}await writeFile(${JSON.stringify(started)},'started');this.control.progress.ownedDocument=true;await this.onProgress();${options.submit ? "this.control.progress.submission={state:'verified',financeFormId:'TEST-SCHOOL-123',verifiedAt:new Date().toISOString()};await this.onProgress();return 'submitted';" : options.projectExpenseQuestion ? "return await this.ask('本笔请选择费用科目',{kind:'project_expense_type',choices:[{value:'1',label:'办公费'},{value:'2',label:'其他教学杂项费用'}]});" : "await this.ask('本地测试等待用户输入',{kind:'pause'});return 'preview';"}}
+async run(){${options.requireLogin ? `await access(${JSON.stringify(loginReady)}).catch(()=>{throw new Error('未找到学校财务首页的“智能网报5.0”。请检查专用浏览器的校园网登录状态。');});` : ''}await writeFile(${JSON.stringify(started)},'started');this.control.progress.ownedDocument=true;await this.onProgress();${options.previewExecution ? previewExecution : options.submit ? "this.control.progress.submission={state:'verified',financeFormId:'TEST-SCHOOL-123',verifiedAt:new Date().toISOString()};await this.onProgress();return 'submitted';" : options.projectExpenseQuestion ? "return await this.ask('本笔请选择费用科目',{kind:'project_expense_type',choices:[{value:'1',label:'办公费'},{value:'2',label:'其他教学杂项费用'}]});" : "await this.ask('本地测试等待用户输入',{kind:'pause'});return 'preview';"}}
 }
 `);
   await writeFile(join(code, 'lib/browser-session.mjs'), `export async function getBrowserSession(){throw Error('test must not open any financial browser');} export async function savePlatformSession(){} export async function savedPlatformUrl(){return '';} export async function browserTargetId(){return null;} export async function browserPageForTarget(){return null;}`);
@@ -459,6 +473,67 @@ test('Didi saves a budget, matches in the worklist and starts an independent sma
   assert.deepEqual(plan.rows, []);
   assert.deepEqual(plan.uploadFiles, []);
   assert.equal(plan.project.projectNo, another.projectNo);
+});
+
+test('a Didi draft can resume after restart and the claim can be removed after the draft is abandoned', async (t) => {
+  const project = { projectNo: 'TEST-2026-01', projectName: '模拟课程经费' };
+  const app = await setup(t, { projects: [project], previewExecution: true });
+  const scope = { sourceRoot: app.sourceRoot };
+  const created = await app.request('/api/didi-claims', { ...scope, budget: '150.25' });
+  assert.equal(created.status, 201);
+  const { id, key } = created.body;
+  await matchClaimProject(app, key, project);
+  assert.equal((await app.request('/api/claim-reason', {
+    ...scope, folder: key, reason: '走访金融实训合作企业的用车费用', explicit: true,
+  })).body.blocker, '');
+  const worklist = async () => (await app.request('/api/folders')).body.claims.find(({ path }) => path === key);
+  const entries = [{ didiId: id, revision: (await worklist()).didi.revision }];
+  const started = await app.request('/api/batch-runs', { entries });
+  assert.equal(started.status, 202);
+  const batchId = started.body.batch.id;
+  const runId = started.body.batch.runs[0].id;
+  const route = `/api/runs/${runId}`;
+  const instruction = (message) => app.request(`${route}/instructions`, { message });
+  const waitForBatch = async (predicate) => {
+    const deadline = Date.now() + 2500;
+    let batch;
+    do {
+      batch = (await app.request(`/api/batches/${batchId}`)).body.batch;
+      if (predicate(batch)) return batch;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } while (Date.now() < deadline);
+    assert.fail(`unexpected batch status: ${batch.status}; ${batch.runs[0].status}; ${batch.runs[0].error}`);
+  };
+  const approval = (batch) => batch.runs[0].pendingKind === 'final_approval';
+  const preview = (batch) => batch.status === 'preview';
+  await waitForBatch(approval);
+  assert.equal((await instruction('先别提交')).status, 200);
+  await waitForBatch(preview);
+  await app.stop();
+  await app.start();
+  const blocked = (await app.request('/api/runs')).body;
+  assert.equal(blocked.blockingRunId, runId);
+  assert.equal(blocked.runs[0].canResumePreview, true);
+  assert.equal((await app.request('/api/batch-runs', { entries })).status, 409);
+  const remove = () => app.request(`/api/didi-claims/${id}`, scope, 'DELETE');
+  assert.equal((await remove()).status, 409);
+
+  const resumed = await instruction('继续');
+  assert.equal(resumed.status, 200);
+  assert.equal(resumed.body.batch.id, batchId);
+  assert.equal(resumed.body.run.id, runId);
+  await waitForBatch(approval);
+  assert.equal((await instruction('先别提交')).status, 200);
+  await waitForBatch(preview);
+  const resolveDraft = (confirmed) => app.request(`${route}/resolution`, { confirmed, resolution: 'abandon_draft' });
+  assert.equal((await resolveDraft(false)).status, 400);
+  const resolved = await resolveDraft(true);
+  assert.equal(resolved.status, 200);
+  assert.equal(resolved.body.run.status, 'abandoned');
+  await waitForBatch((batch) => batch.status === 'abandoned');
+  assert.equal((await app.request('/api/runs')).body.blockingRunId, null);
+  assert.equal((await remove()).status, 200);
+  assert.equal(await worklist(), undefined);
 });
 
 test('payroll only remembers the selected person when historical recipients share a name', async (t) => {

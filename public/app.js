@@ -14,10 +14,16 @@ const TRAVEL_ROLES = [
   { value: 'ministerial_academician', label: '部级及相当职务人员、院士' },
 ];
 const ACTIVE_RUN_STATUSES = new Set(['queued', 'running', 'waiting_input', 'pausing']);
-const CONFIG_STORAGE_KEY = 'reimbursement-assistant-row-configs';
-const storedConfigs = (() => {
-  try { return JSON.parse(localStorage.getItem(CONFIG_STORAGE_KEY) || '{}') || {}; } catch { return {}; }
-})();
+const LEGACY_CONFIG_STORAGE_KEY = 'reimbursement-assistant-row-configs';
+let configStorageKey;
+let storedConfigs = {};
+function selectConfigStorage(workspace) {
+  const scope = workspace ? `:${encodeURIComponent(workspace.owner)}:${workspace.year}` : '';
+  const key = LEGACY_CONFIG_STORAGE_KEY + scope;
+  if (key === configStorageKey) return;
+  configStorageKey = key;
+  try { storedConfigs = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch { storedConfigs = {}; }
+}
 const state = {
   folders: [],
   sourceFolders: [],
@@ -26,6 +32,8 @@ const state = {
   sourceAmounts: new Map(),
   sourceRoot: '',
   demoMode: true,
+  workspace: null,
+  blockingRun: null,
   defaultSourceRoot: '',
   projects: [],
   payrollCategories: [],
@@ -216,9 +224,18 @@ async function prepareSource(item, generation) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { headers: { 'content-type': 'application/json' }, ...options });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || `请求失败（${response.status}）`);
+  const requestHeaders = new Headers(options.headers);
+  requestHeaders.set('content-type', 'application/json');
+  if (state.workspace) requestHeaders.set('x-reimbursement-year', state.workspace.year);
+  let response;
+  try {
+    response = await fetch(path, { ...options, headers: requestHeaders });
+  } catch (error) {
+    if (error.name === 'TimeoutError') throw new Error('本机请求超时，请查看当前状态后重试。');
+    throw new Error('无法连接本机服务。请通过「打开报销助手」启动后重试。');
+  }
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || !payload) throw new Error(payload?.error || `本机服务返回异常（${response.status}）。`);
   return payload;
 }
 
@@ -233,7 +250,8 @@ function persistConfigs() {
       travelFundType: config.travelFundType,
     };
   }
-  try { localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(output)); } catch {}
+  storedConfigs = output;
+  try { localStorage.setItem(configStorageKey, JSON.stringify(output)); } catch {}
 }
 
 function configFor(folder) {
@@ -291,6 +309,7 @@ function setRunDrawer(open) {
 
 function rowStatusFor(folder) {
   const item = itemFor(folder);
+  if (state.blockingRun?.plan.folder === folder) return { type: 'reminder', text: runStatusLabel(state.blockingRun) };
   if (item?.didi) {
     const entry = reasonEntry(folder);
     const needsReason = cleanReason(entry.text) !== entry.confirmed || item.didi.blocker;
@@ -393,10 +412,12 @@ function updateRowInPlace(folder) {
     checkbox.disabled = !selectable;
     checkbox.checked = state.selected.has(folder);
     checkbox.title = selectable ? '勾选以加入报销批次' : '请按此事项的办理系统处理';
-    row.querySelector('.folder-route').textContent = ROUTE_LABELS[reimbursementRouteFor(folder)] || '';
-    updateReasonInPlace(folder, row);
+    const route = row.querySelector('.folder-route');
+    if (route) route.textContent = ROUTE_LABELS[reimbursementRouteFor(folder)] || '';
+    if (row.querySelector('.reason-action')) updateReasonInPlace(folder, row);
     updateAllocationInPlace(folder, row);
-    row.querySelector('.detail-row').disabled = !state.plans.has(folder);
+    const details = row.querySelector('.detail-row');
+    if (details) details.disabled = !state.plans.has(folder);
     const amount = folderAmount(folder);
     row.querySelector('.folder-amount').textContent = amount.value;
     row.querySelector('.folder-amount-label').textContent = amount.label;
@@ -918,7 +939,7 @@ function updateSelectionCount() {
     if (item?.didi) return !item.didi.blocker && cleanReason(reasonEntry(folder).text) === reasonEntry(folder).confirmed;
     return state.plans.get(folder)?.status === 'ready' && state.plans.get(folder).reason === cleanReason(reasonEntry(folder).text) && !allocationState(folder).dirty;
   }).length;
-  $('selectionCount').textContent = count ? `已选 ${count} 个报销事项 · ${ready} 个可执行` : '勾选中间的报销事项后批量执行';
+  $('selectionCount').textContent = count ? `已选 ${count} 个报销事项 · ${state.blockingRun ? '有一笔原任务待处理' : `${ready} 个可执行`}` : '勾选中间的报销事项后批量执行';
   $('mergeClaims').disabled = selected.filter((folder) => !singleProjectClaim(itemFor(folder))).length < 2;
 }
 
@@ -1226,6 +1247,14 @@ async function executeSelected() {
     return;
   }
   const selected = selectedFolders();
+  if (state.blockingRun) {
+    const run = state.blockingRun;
+    const resumeSelected = selected.includes(run.plan.folder) && run.canResumePreview && !otherRunYear(run);
+    showExecutionFeedback(resumeSelected ? '这笔事项已有原草稿。请从「执行与互动」继续原草稿。' : blockingRunText(run),
+      { openRun: true });
+    if (resumeSelected) setRunDrawer(true);
+    return;
+  }
   const direct = selected.map(itemFor).filter(singleProjectClaim);
   const folders = selected.filter((folder) => !singleProjectClaim(itemFor(folder)));
   if (selected.some((folder) => savingMatches.has(projectMatchKey(state.sourceRoot, folder)))) {
@@ -1297,7 +1326,7 @@ async function executeSelected() {
     state.batch = result.batch;
     state.run = null;
     setRunDrawer(true);
-    showExecutionFeedback(`批次已启动，共 ${result.batch.runs.length} 笔。执行器会依次填报并提交。进度见“执行与互动”。${reminderText}`, { blocked: false, folder: reminderFolder });
+    showExecutionFeedback(`批次已启动，共 ${result.batch.runs.length} 笔。请在「执行与互动」核对并逐笔确认提交。${reminderText}`, { blocked: false, folder: reminderFolder });
     renderRun();
   } catch (error) {
     if (/已失效/.test(error.message)) {
@@ -1316,7 +1345,7 @@ async function executeSelected() {
       const failed = folders.find((folder) => state.plans.get(folder)?.status !== 'ready');
       showExecutionFeedback(`重新检查完成 ${recovered}/${folders.length} 个。请查看尚未通过的文件夹。`, { folder: failed });
     } else {
-      showExecutionFeedback(`批次启动失败。${error.message}`);
+      showExecutionFeedback(`批次启动失败。${error.message}`, { openRun: /草稿|财务浏览器|原单/.test(error.message) });
     }
   } finally {
     state.executing = false;
@@ -1325,7 +1354,7 @@ async function executeSelected() {
 }
 
 const runStatusLabels = { queued: '排队中', running: '执行中', waiting_input: '等待你的回复', pausing: '将在当前步骤后暂停', error: '执行暂停', completed: '已提交', preview: '已停在提交前', idle: '尚未执行', verification_required: '结果待核实', stopped: '已停止排队', abandoned: '已结束草稿' };
-const batchStatusLabels = { queued: '排队中', running: '执行中', completed: '已完成', completed_with_errors: '已完成但有失败', error: '失败', preview: '停在提交前', verification_required: '结果待核实', interrupted: '重启后已停止' };
+const batchStatusLabels = { queued: '排队中', running: '执行中', completed: '已完成', completed_with_errors: '已完成但有失败', error: '失败', preview: '停在提交前', verification_required: '结果待核实', interrupted: '重启后已停止', abandoned: '草稿已结束' };
 const waitingForCampusLogin = (run) => run.status === 'running' && run.waitingForCampusLogin;
 const runStatusLabel = (run) => {
   if (waitingForCampusLogin(run)) return '等待校园网登录';
@@ -1340,6 +1369,18 @@ function runReference(run) {
   const label = run.plan.displayName || run.plan.folder;
   const number = run.payrollReceipt?.financeFormId || run.appointment?.financeFormId || run.schoolDraftNo;
   return number ? `${label} · 学校单号 ${number}` : label;
+}
+
+function otherRunYear(run) {
+  return run?.year && state.workspace && run.year !== state.workspace.year ? run.year : null;
+}
+
+function blockingRunText(run) {
+  const year = otherRunYear(run);
+  const next = year ? `请切回 ${year} 年度处理原任务。`
+    : run.canResumePreview ? '可查看并继续原草稿。作废或删除原草稿后，也可登记结束。'
+    : '请查看原任务，核对学校原单状态。';
+  return `当前有一笔任务待处理 · ${runReference(run)} · ${runStatusLabel(run)}。${next}`;
 }
 
 function executionError(value) {
@@ -1358,7 +1399,13 @@ function currentRun() {
 
 function renderRun() {
   const run = currentRun();
-  $('submissionActions').hidden = run?.pendingKind !== 'final_approval';
+  const year = otherRunYear(run);
+  $('submissionActions').hidden = Boolean(year) || run?.pendingKind !== 'final_approval';
+  $('draftActions').hidden = Boolean(year) || (!run?.canResumePreview && !run?.canEndDraft);
+  $('resumeDraft').hidden = !run?.canResumePreview;
+  $('endDraft').hidden = !run?.canEndDraft;
+  $('replyForm').hidden = Boolean(year);
+  if ($('draftActionStatus').dataset.runId !== run?.id) $('draftActionStatus').hidden = true;
   if (!run) {
     $('runStatus').className = 'run-status idle';
     $('runStatus').textContent = '尚未执行';
@@ -1382,6 +1429,7 @@ function renderRun() {
   }).join('') : '';
   $('timeline').innerHTML = run.events.slice(-14).reverse().map((event) => `<div class="event"><time>${new Date(event.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time><span>${escapeHtml(event.step)}${event.detail ? ` · ${escapeHtml(event.detail)}` : ''}</span></div>`).join('');
   $('messages').innerHTML = run.messages.length ? run.messages.map((message) => `<div class="message ${message.role}">${escapeHtml(message.text)}</div>`).join('') : '<div class="empty-chat">执行已经开始，等待网页反馈。</div>';
+  if (year) $('messages').insertAdjacentHTML('beforeend', `<div class="empty-chat">请切回 ${escapeHtml(year)} 年度处理原任务。</div>`);
   if (run.pendingChoices?.length) $('messages').insertAdjacentHTML('beforeend', `<div class="payroll-choices">${run.pendingChoices.map(({ value, label }) =>
     `<button type="button" class="secondary" data-run-choice="${escapeHtml(value)}">${escapeHtml(value + '. ' + label)}</button>`).join('')}</div>`);
   if (run.appointment?.pdfName) $('messages').insertAdjacentHTML('beforeend', `<a href="/api/runs/${escapeHtml(run.id)}/appointment-pdf" target="_blank" rel="noopener">查看报销单 PDF</a>`);
@@ -1421,8 +1469,37 @@ async function sendRunMessage(message) {
   }
 }
 
-async function refreshFolders() {
-  const result = await api('/api/folders');
+async function updateOriginalDraft(end) {
+  const run = currentRun();
+  if (!run || otherRunYear(run) || (end ? !run.canEndDraft : !run.canResumePreview)) return;
+  const status = $('draftActionStatus');
+  if ($('resumeDraft').disabled) return;
+  if (end && !window.confirm('请确认你已在学校系统作废或删除了这张草稿，并核实从未提交。登记后可开始其他事项。')) return;
+  status.dataset.runId = run.id;
+  status.hidden = false;
+  status.textContent = end ? '正在保存核实结果…' : '正在接回原草稿…';
+  $('resumeDraft').disabled = $('endDraft').disabled = true;
+  try {
+    const result = end
+      ? await api(`/api/runs/${run.id}/resolution`, { method: 'POST', body: JSON.stringify({ confirmed: true, resolution: 'abandon_draft' }) })
+      : await api(`/api/runs/${run.id}/instructions`, { method: 'POST', body: JSON.stringify({ message: '继续' }) });
+    if (result.batch) state.batch = result.batch;
+    if (state.batch) {
+      const index = state.batch.runs.findIndex(({ id }) => id === run.id);
+      if (index >= 0) state.batch.runs[index] = result.run;
+    } else state.run = result.run;
+    status.textContent = end ? '已登记原草稿作废。可返回工作清单移除事项或开始新批次。' : '原任务已恢复，进度见上方。';
+    $('executionFeedback').hidden = true;
+    await refreshExecution();
+  } catch (error) {
+    status.textContent = `未能${end ? '登记' : '接回原草稿'}。${error.message}`;
+  } finally {
+    $('resumeDraft').disabled = $('endDraft').disabled = false;
+  }
+}
+
+async function refreshFolders(options) {
+  const result = await api('/api/folders', options);
   const { sourceRoot } = result;
   const generation = ++state.configurationGeneration;
   if (state.sourceRoot !== sourceRoot) {
@@ -1491,7 +1568,20 @@ async function refreshExecution() {
     const completedRunIds = orderedRuns.filter(({ status }) => status === 'completed').map(({ id }) => id).sort().join(',');
     if (state.completedRunIds !== null && state.completedRunIds !== completedRunIds) loadFundingSummary();
     state.completedRunIds = completedRunIds;
-    const actionable = orderedRuns.find((run) => ACTIVE_RUN_STATUSES.has(run.status) || ['preview', 'verification_required'].includes(run.status));
+    const blocking = orderedRuns.find(({ id }) => id === runResult.blockingRunId) || null;
+    const previousBlocker = state.blockingRun;
+    state.blockingRun = blocking;
+    $('blockingRunNotice').hidden = !blocking;
+    if (blocking) $('blockingRunMessage').textContent = blockingRunText(blocking);
+    if (previousBlocker?.id !== blocking?.id || previousBlocker?.status !== blocking?.status) {
+      const changed = [...new Set([previousBlocker?.plan.folder, blocking?.plan.folder])].filter(Boolean);
+      for (const folder of changed) {
+        if (folderRow(folder)?.querySelector('.row-state')) updateRowInPlace(folder);
+      }
+      updateSelectionCount();
+      if (!blocking && $('executionDetails').dataset.openRun === 'true') $('executionFeedback').hidden = true;
+    }
+    const actionable = blocking || orderedRuns.find((run) => ACTIVE_RUN_STATUSES.has(run.status) || ['preview', 'verification_required'].includes(run.status));
     const selected = actionable || orderedRuns[0] || null;
     const matchedBatch = selected ? [...batchResult.batches].reverse().find((batch) => batch.runs.some((run) => run.id === selected.id)) : batchResult.batches.at(-1);
     state.batch = matchedBatch ? { ...matchedBatch, currentRunId: actionable?.id || matchedBatch.currentRunId } : null;
@@ -1576,8 +1666,11 @@ function toggleSelectAll() {
 }
 
 function renderBasicSettings(result) {
+  state.workspace = result.workspace ?? null;
+  selectConfigStorage(state.workspace);
   state.defaultSourceRoot = result.defaultSourceRoot;
   $('sourceRoot').value = result.sourceRoot;
+  $('sourceRoot').readOnly = Boolean(state.workspace);
   if (result.preferences) {
     const { signers, campus, autoPrint, smartPaymentLabel, legacyPaymentLabel, researchProjectNos } = result.preferences;
     $('teachingSigner').value = signers['教学']?.name || '';
@@ -1591,20 +1684,93 @@ function renderBasicSettings(result) {
     $('researchProjectNos').value = (researchProjectNos || []).join('\n');
   }
   state.demoMode = result.demoMode === true;
+  $('openWorkspace').hidden = !state.workspace;
+  $('profileStatus').textContent = state.workspace ? `${state.workspace.owner} · ${state.workspace.year} 年度 · ${state.demoMode ? '示例资料' : '本机资料'}`
+    : state.demoMode ? '示例资料 · 本机服务已连接' : '本机资料 · 服务已连接';
   setReviewArchiveAvailable(!state.demoMode && result.reviewArchiveAvailable === true);
   $('demoIntro').hidden = !state.demoMode;
   $('schoolAccess').hidden = state.demoMode;
   $('liveWorklist').hidden = state.demoMode;
   $('fundingSync').hidden = state.demoMode;
   $('runToggle').hidden = state.demoMode;
-  $('returnToDemo').hidden = state.demoMode;
+  $('returnToDemo').hidden = state.demoMode || Boolean(state.workspace);
   $('saveRoot').textContent = state.demoMode ? '启用正式模式' : '保存基本信息';
+  $('saveRoot').hidden = Boolean(state.workspace && state.demoMode);
   if (state.demoMode) setRunDrawer(false);
   $('paymentCardLast4').placeholder = result.paymentCardConfigured ? '已配置，留空保留' : '请输入公务卡尾号 4 位';
 }
 
 async function loadConfig() {
-  renderBasicSettings(await api('/api/config'));
+  renderBasicSettings(await api('/api/config', { signal: AbortSignal.timeout(15000) }));
+}
+
+let availableOwners = [];
+
+function renderWorkspaceYears() {
+  const owner = availableOwners.find(({ name }) => name === $('workspaceOwner').value);
+  const select = $('workspaceYear');
+  const previous = select.value;
+  select.replaceChildren();
+  for (const year of owner?.years ?? []) select.add(new Option(`${year} 年度`, year));
+  if (owner && !owner.example) select.add(new Option('新建年度…', 'new'));
+  select.value = [...select.options].some(({ value }) => value === previous) ? previous
+    : owner?.name === state.workspace?.owner ? state.workspace?.year : select.options[0]?.value;
+  if (select.selectedIndex < 0 && select.options.length) select.selectedIndex = 0;
+  renderWorkspaceChoice();
+}
+
+function renderWorkspaceChoice() {
+  const newOwner = $('workspaceOwner').value === '';
+  const newYear = newOwner || $('workspaceYear').value === 'new';
+  $('newWorkspaceOwnerField').hidden = !newOwner;
+  $('newWorkspaceOwner').required = newOwner;
+  $('workspaceYearField').hidden = newOwner;
+  $('workspaceYear').required = !newOwner;
+  $('newWorkspaceYearField').hidden = !newYear;
+  $('newWorkspaceYear').required = newYear;
+  $('applyWorkspace').textContent = newYear ? '创建并打开' : '打开';
+  $('workspaceDirectoryHint').textContent = newYear ? '把自己的年度台账、学校导出表和票据放入程序下的 owner / 使用人 / 年度 文件夹。' : '';
+}
+
+async function openWorkspaceChooser(create = false) {
+  const dialog = $('workspaceDialog');
+  const button = $('applyWorkspace');
+  const status = $('workspaceStatus');
+  if (!dialog.open) dialog.showModal();
+  button.disabled = true;
+  status.textContent = '正在读取本机目录…';
+  try {
+    const result = await api('/api/workspaces', { signal: AbortSignal.timeout(15000) });
+    availableOwners = result.owners;
+    const select = $('workspaceOwner');
+    select.replaceChildren(...availableOwners.map(({ name }) => new Option(name, name)), new Option('新建使用人…', ''));
+    select.value = create ? '' : result.current.owner;
+    $('newWorkspaceYear').value = String(new Date().getFullYear());
+    renderWorkspaceYears();
+    status.textContent = '';
+    button.disabled = false;
+  } catch (error) { status.textContent = error.message; }
+}
+
+async function openSelectedWorkspace(event) {
+  event.preventDefault();
+  const button = $('applyWorkspace');
+  const status = $('workspaceStatus');
+  const chosen = $('workspaceOwner').value;
+  const create = !chosen || $('workspaceYear').value === 'new';
+  const owner = chosen || $('newWorkspaceOwner').value.trim();
+  const year = create ? $('newWorkspaceYear').value.trim() : $('workspaceYear').value;
+  button.disabled = true;
+  status.textContent = '正在打开本机资料…';
+  try {
+    await Promise.all([...reasonEntries.values()].filter((entry) => entry.sourceRoot === state.sourceRoot && cleanReason(entry.text) !== entry.saved)
+      .map((entry) => saveReasonDraft(entry)));
+    const { location } = await api('/api/workspaces', { method: 'POST', body: JSON.stringify({ owner, year, create }) });
+    window.location.assign(location);
+  } catch (error) {
+    status.textContent = error.message;
+    button.disabled = false;
+  }
 }
 
 async function saveRoot(demoMode = false) {
@@ -1655,15 +1821,23 @@ async function saveRoot(demoMode = false) {
 }
 
 async function refreshFoldersManually() {
-  $('refreshFolders').disabled = true;
+  const button = $('refreshFolders');
+  const status = $('folderRefreshStatus');
+  button.disabled = true;
+  button.textContent = '刷新中…';
+  status.hidden = false;
+  status.textContent = '正在读取本机票据目录…';
   try {
     state.sourceAmounts.clear();
-    await refreshFolders();
+    await refreshFolders({ signal: AbortSignal.timeout(30000) });
     loadFundingSummary();
-    setWorklistStatus('文件夹清单已刷新，正在重新核对当前附件。');
+    status.textContent = `文件夹已刷新。读取到 ${state.sourceFolders.length} 个来源文件夹。`;
     autoCheckAll();
+  } catch (error) {
+    status.textContent = `刷新失败。${error.message}`;
   } finally {
-    $('refreshFolders').disabled = false;
+    button.disabled = false;
+    button.textContent = '刷新文件夹';
   }
 }
 
@@ -1702,13 +1876,14 @@ async function init() {
     await refreshExecution();
     autoCheckAll();
   } catch (error) {
+    if (!$('liveWorklist').hidden || !state.workspace) $('profileStatus').textContent = `读取本机资料失败。${error.message}`;
     setWorklistStatus(error.message);
     $('folderRows').textContent = '读取失败，请检查本地服务。';
   }
 }
 
 const loadModelSettings = bindModelSettings(api);
-const loadFundingSummary = bindFundingSummary({ api, money, escapeHtml, onPayrollSync: refreshFolders });
+const loadFundingSummary = bindFundingSummary({ api, money, escapeHtml, onPayrollSync: refreshFolders, currentYear: () => state.workspace?.year });
 const setReviewArchiveAvailable = bindReviewArchive(api);
 
 async function refreshSavedClaim(folder, message, focus = true) {
@@ -1788,10 +1963,18 @@ $('openSettings').addEventListener('click', async () => {
   }
 });
 $('closeSettings').addEventListener('click', () => $('settingsDialog').close());
-$('setupLive').addEventListener('click', () => $('openSettings').click());
+$('openWorkspace').addEventListener('click', () => openWorkspaceChooser());
+$('setupLive').addEventListener('click', () => state.workspace ? openWorkspaceChooser(true) : $('openSettings').click());
+$('closeWorkspace').addEventListener('click', () => $('workspaceDialog').close());
+$('workspaceForm').addEventListener('submit', openSelectedWorkspace);
+$('workspaceOwner').addEventListener('change', renderWorkspaceYears);
+$('workspaceYear').addEventListener('change', renderWorkspaceChoice);
 $('returnToDemo').addEventListener('click', () => saveRoot(true));
 $('confirmSubmission').addEventListener('click', () => sendRunMessage('确认提交'));
 $('skipSubmission').addEventListener('click', () => sendRunMessage('先别提交'));
+$('resumeDraft').addEventListener('click', () => updateOriginalDraft(false));
+$('endDraft').addEventListener('click', () => updateOriginalDraft(true));
+$('viewBlockingRun').addEventListener('click', () => setRunDrawer(true));
 $('settingsDialog').addEventListener('close', () => { $('paymentCardLast4').value = ''; });
 $('basicSettingsForm').addEventListener('submit', (event) => {
   event.preventDefault();
@@ -1854,6 +2037,11 @@ $('folderRows').addEventListener('click', (event) => {
     return;
   }
   if (entry?.didi && event.target.closest('[data-remove-didi]')) {
+    if (state.blockingRun?.plan.folder === entry.path) {
+      showExecutionFeedback('这笔事项还有学校原草稿。请先继续原草稿，或在学校作废后登记结束，再移除。', { openRun: true });
+      setRunDrawer(true);
+      return;
+    }
     const sourceRoot = state.sourceRoot;
     const button = event.target.closest('[data-remove-didi]');
     button.disabled = true;
@@ -1866,7 +2054,8 @@ $('folderRows').addEventListener('click', (event) => {
       reasonEntries.delete(key);
       renderRows();
       setWorklistStatus('已移除这笔贸大出行。');
-    }).catch((error) => setWorklistStatus(error.message)).finally(() => { button.disabled = false; });
+    }).catch((error) => showExecutionFeedback(`移除失败。${error.message}`, { openRun: /草稿|执行|核实/.test(error.message) }))
+      .finally(() => { button.disabled = false; });
     return;
   }
   if (entry?.payroll && event.target.closest('.edit-payroll')) {
@@ -1946,9 +2135,11 @@ $('folderRows').addEventListener('submit', (event) => {
   saveClaimPurpose(event);
 });
 window.addEventListener('pagehide', () => {
+  const headers = { 'content-type': 'application/json' };
+  if (state.workspace) headers['x-reimbursement-year'] = state.workspace.year;
   for (const entry of reasonEntries.values()) {
     if (entry.sourceRoot !== state.sourceRoot || cleanReason(entry.text) === entry.saved) continue;
-    fetch('/api/claim-reason', { method: 'POST', headers: { 'content-type': 'application/json' }, body: reasonRequest(entry), keepalive: true }).catch(() => undefined);
+    fetch('/api/claim-reason', { method: 'POST', headers, body: reasonRequest(entry), keepalive: true }).catch(() => undefined);
   }
 });
 $('projectFilter').addEventListener('input', renderProjects);
