@@ -12,7 +12,7 @@ import { askInteractionAgent, parseInstruction } from './lib/codex.mjs';
 import { executeRunWithRecovery } from './lib/execution-recovery.mjs';
 import { didiBudgetCny, validateDidiSelection } from './lib/didi-invoices.mjs';
 import { normalizeModelSettings, publicModelSettings, readModelSettings } from './lib/model-settings.mjs';
-import { fundingSummaryCsv, readFundingExports, readPayrollPeople, summarizeFunding } from './lib/funding-summary.mjs';
+import { documentNumber, fundingSummaryCsv, readFundingExports, readPayrollPeople, summarizeFunding } from './lib/funding-summary.mjs';
 import { DEFAULT_PORT, isInsideDirectory, privateDataDirectory, profileId, receiptDirectory, serviceRevision } from './lib/platform.mjs';
 import { DEFAULT_PREFERENCES, localPreferences, localSigner, projectFunding } from './lib/local-settings.mjs';
 import { createSchoolFundingSync } from './lib/school-funding-sync.mjs';
@@ -61,6 +61,7 @@ const PLANS_FILE = join(RUNTIME_DIR, 'plans.json');
 const CONFIG_FILE = join(RUNTIME_DIR, 'config.json');
 const MODEL_CONFIG_FILE = join(RUNTIME_DIR, 'model-config.json');
 const FUNDING_ATTRIBUTIONS_FILE = join(RUNTIME_DIR, 'funding-attributions.json');
+const FUNDING_WITHDRAWALS_FILE = join(RUNTIME_DIR, 'funding-withdrawals.json');
 let demoMode = DEFAULT_DEMO;
 let SOURCE_ROOT = workspace?.sourceRoot ?? (demoMode ? EXAMPLE_ROOT : DEFAULT_SOURCE_ROOT);
 let liveSourceRoot = DEFAULT_SOURCE_ROOT;
@@ -85,6 +86,7 @@ let history = { submittedInvoiceNumbers: [], submittedPaymentKeys: [], withdrawa
 let projectCatalog = { projects: [], syncedAt: null };
 let projectMatches = new Map();
 let fundingAttributions = new Map();
+let fundingWithdrawals = new Map();
 let claimReasons = new Map();
 let claimGroups = new Map();
 let payrollRecipients = new Map();
@@ -110,6 +112,8 @@ try {
   })));
 } catch {}
 try { fundingAttributions = new Map(JSON.parse(await readFile(FUNDING_ATTRIBUTIONS_FILE, 'utf8'))); } catch {}
+try { fundingWithdrawals = new Map(JSON.parse(await readFile(FUNDING_WITHDRAWALS_FILE, 'utf8'))); }
+catch (error) { if (error.code !== 'ENOENT') throw error; }
 try {
   const saved = JSON.parse(await readFile(CLAIM_REASONS_FILE, 'utf8'));
   claimReasons = new Map(saved.map(([key, reason]) => [
@@ -424,7 +428,13 @@ async function fundingSnapshot(sourceRoot) {
   const exports = await readFundingExports(sourceRoot);
   if (demoMode) return { ...summarizeFunding({ exports, sourceRoot }), demoMode: true };
   const activeReceipts = [...runs.values()].filter((run) => !claimWithdrawalFor(history, run.id));
-  return summarizeFunding({ exports, sourceRoot, projects: projectCatalog.projects, runs: activeReceipts, attributions: fundingAttributions });
+  const scope = `${sourceRoot}\0`;
+  const restorable = new Set([...fundingWithdrawals.keys()].filter((key) => key.startsWith(scope)).map((key) => key.slice(scope.length)));
+  const withdrawals = new Set(restorable);
+  for (const { financeFormId, sourceRoot: originalRoot } of history.withdrawals || []) {
+    if (financeFormId && originalRoot === sourceRoot) withdrawals.add(documentNumber(financeFormId));
+  }
+  return summarizeFunding({ exports, sourceRoot, projects: projectCatalog.projects, runs: activeReceipts, attributions: fundingAttributions, withdrawals, restorable });
 }
 
 function folderHasOpenRun(sourceRoot, folder) {
@@ -1751,6 +1761,36 @@ async function route(request, response) {
       'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file)}` });
     return response.end(content);
   }
+  if (url.pathname === '/api/funding-summary/withdrawal' && ['POST', 'DELETE'].includes(request.method)) {
+    const { sourceRoot, financeId: originalId, confirmed } = await body(request);
+    const financeId = documentNumber(originalId);
+    if (typeof originalId !== 'string' || !financeId || financeId.length > 128 || /[\x00-\x1f\x7f]/u.test(financeId)) throw httpError(400, '请选择要核对的学校单号。');
+    return withWorklistWrite(async () => {
+      if (sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据目录已切换，请重新读取报销汇总。');
+      const key = `${sourceRoot}\0${financeId}`;
+      const restore = request.method === 'DELETE';
+      const updated = new Map(fundingWithdrawals);
+      if (restore) updated.delete(key);
+      else {
+        if (confirmed !== true) throw httpError(400, '请确认已在学校系统撤回或作废该单。');
+        if ([...runs.values()].some((run) => run.sourceRoot === sourceRoot && !claimWithdrawalFor(history, run.id) &&
+            documentNumber(run.control.progress.submission.financeFormId || run.control.progress.submission.documentId) === financeId)) {
+          throw httpError(409, '本机有这笔执行记录，请从「已办理」登记撤回。');
+        }
+        if (!updated.has(key)) {
+          const { records } = await readFundingExports(sourceRoot);
+          const rows = records.filter((record) => documentNumber(record.financeId) === financeId && ['smart', 'legacy'].includes(record.kind));
+          if (!rows.some(({ state }) => state === 'pending') || rows.some(({ state }) => state === 'booked')) {
+            throw httpError(409, '年度学校导出表中没有可登记撤回的待入账单据。');
+          }
+          updated.set(key, { withdrawnAt: new Date().toISOString() });
+        }
+      }
+      await atomicJson(FUNDING_WITHDRAWALS_FILE, [...updated]);
+      fundingWithdrawals = updated;
+      return json(response, 200, { financeId, withdrawn: !restore });
+    });
+  }
   if (request.method === 'POST' && url.pathname === '/api/funding-summary/attribution') {
     if (request.headers['content-type']?.split(';')[0].trim() !== 'application/json') throw httpError(415, '请在报销汇总页面选择台账名目');
     const { sourceRoot, recordKey, ledgerNo } = await body(request);
@@ -1869,6 +1909,17 @@ async function route(request, response) {
       if (folderHasOpenRun(sourceRoot, previous.folder)) throw httpError(409, '本笔正在执行或待核实，请先处理当前任务再改材料或金额');
       if (input.fingerprint !== previous.fingerprint) throw httpError(409, '附件已变化，材料确认已失效');
       const confirmations = { fingerprint: input.fingerprint };
+      const paymentLinks = input.paymentLinks ?? previous.confirmations?.paymentLinks;
+      if (paymentLinks !== undefined) {
+        const invoices = new Set(previous.rows.map(({ invoiceNumber }) => invoiceNumber));
+        const payments = new Set(previous.paymentCandidates?.map(({ name }) => name));
+        if (!previous.paymentCandidates || !paymentLinks || typeof paymentLinks !== 'object' || Array.isArray(paymentLinks) ||
+            Object.entries(paymentLinks).some(([invoice, names]) => !invoices.has(invoice) || !Array.isArray(names) ||
+              new Set(names).size !== names.length || names.some((name) => !payments.has(name)))) {
+          throw httpError(400, '请选择本次检查中识别到的发票和有效付款凭证。');
+        }
+        confirmations.paymentLinks = paymentLinks;
+      }
       for (const key of ['receiptFile', 'sealedDetailFile', 'assetFile']) if (previous.supportingFiles.includes(input[key])) confirmations[key] = input[key];
       confirmations.paymentCardConfirmed = input.paymentCardConfirmed === true;
       if (previous.subject === '电脑配件') {

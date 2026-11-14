@@ -473,7 +473,17 @@ function renderMaterialReview(plan) {
     const value = confirmed.paidAmountsCny?.[row.invoiceNumber];
     return `<label>发票 ${escapeHtml(row.invoiceNumber)} 的实付金额（元）<input type="number" min="0.01" step="0.01" inputmode="decimal" data-paid-invoice="${escapeHtml(row.invoiceNumber)}" value="${Number.isSafeInteger(value) ? (value / 100).toFixed(2) : ''}"></label>`;
   }).join('');
+  const payments = plan.paymentCandidates || [];
+  const paymentFields = payments.length && plan.rows.length ? `<details class="funding-data">
+    <summary>核对发票对应的付款凭证</summary>
+    <p class="muted">按发票勾选实际对应的付款，可选多笔。保存前请核对金额、日期和交易明细。</p>
+    ${plan.rows.map((row) => `<fieldset data-invoice-payments="${escapeHtml(row.invoiceNumber)}">
+      <legend>${escapeHtml(plan.fileSources?.[row.invoiceFile]?.folder || row.invoiceFile)} · 发票 ${escapeHtml(row.invoiceNumber)} · ${money(row.invoiceAmountCny)}</legend>
+      ${payments.map(({ name, amountCny, date }) => `<label class="checkbox-row"><input type="checkbox" value="${escapeHtml(name)}" ${row.paymentFiles.includes(name) ? 'checked' : ''}>${escapeHtml(plan.fileSources?.[name]?.name || name)} · ${money(amountCny)}${date ? ' · ' + escapeHtml(date) : ''}${plan.fileSources?.[name] ? ' · ' + escapeHtml(plan.fileSources[name].folder) : ''}</label>`).join('')}
+    </fieldset>`).join('')}
+  </details>` : '';
   return `<section class="detail-section"><h3>材料核对${paidFields ? '与合并付款分配' : ''}</h3><p class="muted">签字、印章和公务卡核对只作提醒。材料确认和分配金额只用于当前附件。</p>
+    ${paymentFields}
     <div class="edit-grid">
     ${paidFields}
     ${purchase ? `<label>我已核对签字的签收单<select id="confirmReceipt">${options(confirmed.receiptFile)}</select></label>` : ''}
@@ -497,7 +507,16 @@ async function saveMaterialReview() {
     }
     paidAmountsCny[input.dataset.paidInvoice] = amount;
   }
-  const payload = { fingerprint: plan.fingerprint, receiptFile: $('confirmReceipt')?.value, assetFile: $('confirmAsset')?.value, sealedDetailFile: $('confirmSeal')?.value, paymentCardConfirmed: $('confirmCard').checked, governmentProcurement: $('confirmGovernmentProcurement')?.checked === true, paidAmountsCny };
+  const paymentLinks = { ...plan.confirmations?.paymentLinks };
+  for (const field of $('detailContent').querySelectorAll('[data-invoice-payments]')) {
+    const invoice = field.dataset.invoicePayments;
+    const inputs = [...field.querySelectorAll('input[type="checkbox"]')];
+    if (inputs.some((input) => input.checked !== input.defaultChecked)) {
+      paymentLinks[invoice] = inputs.filter(({ checked }) => checked).map(({ value }) => value);
+    }
+  }
+  const payload = { fingerprint: plan.fingerprint, receiptFile: $('confirmReceipt')?.value, assetFile: $('confirmAsset')?.value, sealedDetailFile: $('confirmSeal')?.value, paymentCardConfirmed: $('confirmCard').checked, governmentProcurement: $('confirmGovernmentProcurement')?.checked === true, paidAmountsCny,
+    ...(Object.keys(paymentLinks).length ? { paymentLinks } : {}) };
   $('saveMaterials').disabled = true;
   try {
     const result = await api(`/api/plans/${plan.id}/confirmations`, { method: 'POST', body: JSON.stringify(payload) });

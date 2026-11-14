@@ -53,6 +53,21 @@ test('a single invoice can be paid by several settled payments and large differe
   }
 });
 
+test('manually linking split payments uses settled evidence and keeps amount checks', () => {
+  const docs = [invoice(1, 12400), payment(1, 5200), payment(2, 7200)];
+  const confirmations = { paymentLinks: { [invoiceNo(1)]: ['支付1.png', '支付2.png'] } };
+  const result = assess(docs, { confirmations });
+  assert.equal(result.status, 'ready');
+  assert.equal(result.totalCny, 12400);
+  assert.deepEqual(result.rows[0].paymentFiles, ['支付1.png', '支付2.png']);
+  assert.equal(result.paymentKeys.filter((key) => key.startsWith('transaction:')).length, 2);
+
+  const reversed = assess([...docs.slice(0, 2), { ...docs[2], text: '已退款' }], { confirmations });
+  assert.equal(reversed.status, 'blocked');
+  assert.equal(reversed.paymentCandidates.length, 1);
+  assert.match(reversed.blockers.join(' '), /金额差额过大/);
+});
+
 test('one settled payment can cover several invoices referenced by their order numbers', () => {
   const documents = [
     invoice(1, 10000, { orderNumber: 'order-1' }), invoice(2, 6000, { orderNumber: 'order-2' }),

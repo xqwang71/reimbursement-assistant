@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cp, mkdir, rename, writeFile, readFile, access, stat } from 'node:fs/promises';
+import { cp, mkdir, rename, writeFile, readFile, access, stat, readdir, unlink } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { cachedFixture, concretePurpose } from './fixtures.mjs';
@@ -59,7 +59,7 @@ async function setup(t, options = {}) {
   await cp(join(source, 'lib'), join(code, 'lib'), { recursive: true });
   await mkdir(join(code, 'public'));
   await cp(join(source, 'public/project-allocation.js'), join(code, 'public/project-allocation.js'));
-  if (options.payrollHistory) {
+  if (options.payrollHistory || options.fundingExport) {
     await mkdir(join(code, 'scripts'));
     await cp(join(source, 'scripts/read_funding_exports.py'), join(code, 'scripts/read_funding_exports.py'));
   }
@@ -192,6 +192,29 @@ export async function executeSchoolPayroll({plan, payroll, control, validate, pe
   };
   return { ...input, plan, request, started, loginReady, appointmentAttempts, appointmentReady, start, stop };
 }
+
+test('an export-only withdrawal persists across checks and can be removed locally', async (t) => {
+  const app = await setup(t, { fundingExport: true });
+  const file = join(app.sourceRoot, '报销单统计.xlsx');
+  await cp(join(source, 'examples/2026/报销单统计.xlsx'), file);
+  const route = '/api/funding-summary/withdrawal';
+  const pending = { sourceRoot: app.sourceRoot, financeId: 'DEMO-SMART-002', confirmed: true };
+  const progress = async () => (await app.request('/api/funding-summary')).body.totals.submittedCny;
+  const original = await readFile(file);
+  assert.equal(await progress(), 45000);
+  assert.equal((await app.request(route, { ...pending, confirmed: false })).status, 400);
+  assert.equal((await app.request(route, { ...pending, sourceRoot: 'another year' })).status, 409);
+  assert.equal((await app.request(route, { ...pending, financeId: 'DEMO-SMART-001' })).status, 409);
+  assert.equal((await app.request(route, pending)).status, 200);
+  assert.equal((await app.request(route, pending)).status, 200);
+  assert.equal(await progress(), 0);
+  await app.stop();
+  await app.start();
+  assert.equal(await progress(), 0);
+  assert.equal((await app.request(route, pending, 'DELETE')).status, 200);
+  assert.equal(await progress(), 45000);
+  assert.deepEqual(await readFile(file), original);
+});
 
 test('model settings retain only environment variable names and route enabled interaction', async (t) => {
   const app = await setup(t, {
@@ -1135,6 +1158,31 @@ test('manual material confirmations survive an unchanged recheck', async (t) => 
   assert.equal(repeated.status, 'ready', JSON.stringify(repeated.blockers));
   assert.equal(repeated.confirmations.receiptFile, '签收单.pdf');
   assert.ok(!repeated.warnings.some((warning) => /缺少已核对签字/.test(warning)));
+});
+
+test('manual payment links validate the evidence and survive rechecking unchanged attachments', async (t) => {
+  const app = await setup(t, { payment: 10000, order: null });
+  const cache = join(app.appDir, '.runtime/cache', encodeURIComponent(app.folder));
+  const files = await readdir(cache);
+  await Promise.all(files.filter((name) => name.startsWith('selection-')).map((name) => unlink(join(cache, name))));
+  const initial = await app.plan();
+  assert.equal(initial.status, 'blocked');
+  const [invoice] = initial.rows;
+  const payment = initial.paymentCandidates[0].name;
+  const confirm = (names) => app.request(`/api/plans/${initial.id}/confirmations`, {
+    fingerprint: initial.fingerprint, paymentLinks: { [invoice.invoiceNumber]: names },
+  });
+  assert.equal((await confirm([invoice.invoiceFile])).status, 400);
+  const confirmed = await confirm([payment]);
+  assert.equal(confirmed.status, 200);
+  assert.equal(confirmed.body.plan.status, 'ready');
+  assert.equal(confirmed.body.plan.totalCny, 10000);
+  const repeated = await app.plan();
+  assert.deepEqual(repeated.rows[0].paymentFiles, [payment]);
+  await writeFile(join(app.batchDir, '补充材料.bin'), '本地模拟附件');
+  const rechecked = await app.plan(undefined, { confirm: false });
+  assert.equal(rechecked.confirmations.paymentLinks, undefined);
+  assert.equal(rechecked.status, 'blocked');
 });
 
 test('government procurement remains selected when asset evidence needs reconfirmation', async (t) => {
