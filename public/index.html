@@ -26,6 +26,7 @@
     <section class="panel worklist-panel">
       <div id="liveWorklist" hidden>
       <div class="panel-title"><div><h2>批量工作清单</h2><p>左栏合并文件夹时选择办理方式，中栏填写事由，右栏选择经费。勾选核对好的事项后执行。</p></div><button id="refreshFolders" class="secondary" type="button">刷新文件夹</button></div>
+      <div class="receipt-directory"><span class="muted">原票据目录 <span id="receiptDirectory"></span></span><button id="copyReceiptDirectory" class="text-button" type="button">复制路径</button><button id="editReceiptDirectory" class="text-button" type="button" hidden>更改目录</button></div>
       <p id="folderRefreshStatus" class="muted" role="status" hidden></p>
       <div id="blockingRunNotice" class="execution-feedback is-blocked" hidden>
         <p id="blockingRunMessage" role="status"></p>
@@ -202,11 +203,27 @@
         <label id="newWorkspaceOwnerField" hidden>新使用人名称<input id="newWorkspaceOwner" maxlength="40" autocomplete="off"></label>
         <label id="workspaceYearField">年度<select id="workspaceYear" required></select></label>
         <label id="newWorkspaceYearField" hidden>新年度<input id="newWorkspaceYear" inputmode="numeric" pattern="20[0-9]{2}" maxlength="4"></label>
+        <label id="newWorkspaceSourceField" hidden>原票据目录<input id="newWorkspaceSource" placeholder="粘贴已有年度文件夹的完整路径" autocomplete="off"></label>
         <p id="workspaceDirectoryHint" class="muted"></p>
       </div>
       <div class="settings-actions">
         <button id="applyWorkspace" class="primary" type="submit">打开</button>
         <p id="workspaceStatus" class="muted" role="status"></p>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="receiptDirectoryDialog" class="settings-dialog claim-route-dialog" aria-labelledby="receiptDirectoryTitle">
+    <header class="modal-header"><h2 id="receiptDirectoryTitle">更改原票据目录</h2></header>
+    <form id="receiptDirectoryForm" class="settings-content">
+      <div class="settings-fields">
+        <label>原票据目录<input id="receiptDirectoryPath" autocomplete="off" required></label>
+        <p class="muted">选择同一年度原票据所在的文件夹。助手会读取此目录，并沿用该年度的报销事项和历史。</p>
+      </div>
+      <div class="settings-actions">
+        <button id="saveReceiptDirectory" class="primary" type="submit">保存并刷新</button>
+        <button id="closeReceiptDirectory" class="secondary" type="button">取消</button>
+        <p id="receiptDirectoryStatus" class="muted" role="status"></p>
       </div>
     </form>
   </dialog>

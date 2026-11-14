@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cp, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { createPlan, validatePlanForExecution } from '../lib/planner.mjs';
+import { pathToFileURL } from 'node:url';
+import { createPlan, fingerprintFolder, validatePlanForExecution } from '../lib/planner.mjs';
 import { confirmClaimPurpose } from '../lib/claim-purpose.mjs';
 import { cachedFixture, concretePurpose } from './fixtures.mjs';
 
@@ -126,6 +127,34 @@ test('cached invoice text normalizes spaces within the label, number, amount and
   assert.equal(plan.rows[0].date, '2026-11-01');
   assert.equal(plan.invoiceTotalCny, 10000);
   assert.equal(plan.totalCny, 9000);
+});
+
+test('refresh reuses unchanged document text and recalculates a replaced payment', async (t) => {
+  const input = await cachedFixture(t, { payment: null });
+  const cacheFile = join(input.appDir, '.runtime/cache', encodeURIComponent(input.folder), `${input.fingerprint}.json`);
+  const initial = await fingerprintFolder(input.sourceRoot, input.folder);
+  const raw = JSON.parse(await readFile(cacheFile, 'utf8'));
+  for (const doc of raw.documents) doc.file = initial.files.find((file) => file.name === doc.file.name);
+  await writeFile(cacheFile, JSON.stringify(raw));
+  // Reuse the same public OCR entry point with a synthetic reader for text fixtures.
+  const program = new URL('../', import.meta.url);
+  const code = join(input.appDir, 'code');
+  for (const directory of ['lib', 'public', 'scripts']) await cp(new URL(directory, program), join(code, directory), { recursive: true });
+  await writeFile(join(code, 'package.json'), '{"type":"module"}');
+  await writeFile(join(code, 'scripts', 'rapid_ocr.py'), `from pathlib import Path\nimport json, sys\nitems=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))['files']\nassert all(item['name'] == 'payment.txt' for item in items)\nPath(sys.argv[2]).write_text(json.dumps({'files':[{'name':item['name'],'pages':[Path(item['path']).read_text(encoding='utf-8')]} for item in items]}), encoding='utf-8')\n`);
+  const { createPlan: planFromFixtures } = await import(pathToFileURL(join(code, 'lib', 'planner.mjs')));
+  const payment = join(input.batchDir, 'payment.txt');
+  const evidence = '交易成功\n交易金额：75.25\n订单编号：1234567890123456';
+  await writeFile(payment, evidence);
+  const checked = await planFromFixtures(input);
+  assert.equal(checked.cacheState, 'new');
+  assert.equal(checked.totalCny, 7525);
+  await writeFile(payment, evidence.replace('75.25', '89.50'));
+  const updated = await planFromFixtures(input);
+  assert.notEqual(updated.fingerprint, checked.fingerprint);
+  assert.equal(updated.invoiceTotalCny, 10000);
+  assert.equal(updated.totalCny, 8950);
+  assert.equal((await planFromFixtures(input)).cacheState, 'cached');
 });
 
 test('a payment can establish the amount when the invoice has no matching order', async (t) => {

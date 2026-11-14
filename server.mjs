@@ -20,7 +20,7 @@ import { checkSchoolFinancePage } from './lib/school-finance-access.mjs';
 import { listWebProjects } from './lib/projects.mjs';
 import { browserPageForTarget, browserTargetId, getBrowserSession, savePlatformSession, savedPlatformUrl } from './lib/browser-session.mjs';
 import { CAMPUS_LOGIN_REQUIRED } from './lib/portal-navigation.mjs';
-import { loadMemory, learnExpenseType, applyLearning, rememberPlanEdit, EXPENSE_TYPES } from './lib/memory.mjs';
+import { loadMemory, saveMemory, learnExpenseType, applyLearning, rememberPlanEdit, EXPENSE_TYPES } from './lib/memory.mjs';
 import { DEFAULT_TRAVEL_PROFILE } from './lib/travel.mjs';
 import { matchProjects, planProjects } from './public/project-allocation.js';
 import { captureBocQuote, readBocQuote } from './lib/boc-rates.mjs';
@@ -32,7 +32,7 @@ import { readSchoolPayrollStates } from './lib/school-payroll-status.mjs';
 import { searchSchoolStudents, STUDENT_PAYROLL } from './lib/school-payroll-people.mjs';
 import { saveAppointmentPdf } from './lib/school-appointment-pdf.mjs';
 import { hasReviewArchive, listArchivedBatches, readArchivedBatch, reviewArchivePath } from './lib/review-archive.mjs';
-import { answerWorkspaceRequests, isWorkspaceYear, listWorkspaces, publicWorkspace, requestWorkspaceProcess, resolveWorkspace } from './lib/workspaces.mjs';
+import { answerWorkspaceRequests, isWorkspaceYear, listWorkspaces, publicWorkspace, readWorkspaceSources, requestWorkspaceProcess, resolveWorkspace, saveWorkspaceSource, workspaceRecordRoot } from './lib/workspaces.mjs';
 
 const APP_DIR = await realpath(fileURLToPath(new URL('.', import.meta.url)));
 const SERVICE_REVISION = await serviceRevision(APP_DIR);
@@ -42,6 +42,7 @@ let workspace = process.send && process.env.REIMBURSEMENT_WORKSPACE
 const workspaceAtLaunch = workspace;
 const EXAMPLE_ROOT = join(APP_DIR, 'examples', '2099');
 const DATA_APP_DIR = await privateDataDirectory(APP_DIR, process.env, workspace);
+let annualSources = workspace && !workspace.example ? await readWorkspaceSources(DATA_APP_DIR) : new Map();
 const PROFILE_ID = profileId(DATA_APP_DIR);
 const RUNTIME_DIR = join(DATA_APP_DIR, '.runtime');
 const REVIEW_ARCHIVE_FILE = reviewArchivePath(RUNTIME_DIR);
@@ -133,6 +134,7 @@ try {
 } catch {}
 try { bookingOptions = new Map(JSON.parse(await readFile(BOOKING_OPTIONS_FILE, 'utf8'))); } catch {}
 memory = await loadMemory(DATA_APP_DIR);
+if (annualSources.size) useWorkspaceRecordRoots();
 const savedConfig = await readFile(CONFIG_FILE, 'utf8').then(JSON.parse, (error) => {
   if (error.code === 'ENOENT') return null;
   throw error;
@@ -150,13 +152,15 @@ if (savedConfig) {
 try {
   const savedPlans = JSON.parse(await readFile(PLANS_FILE, 'utf8'));
   for (const plan of savedPlans) {
+    const sourceRoot = workspaceRecordRoot(annualSources, plan.sourceRoot);
     if (plan?.purpose && typeof plan.reason === 'string' && plan.reason && plan.sourceRoot && plan.folder && !isReimbursedFolder(plan.folder)) {
-      const key = projectMatchKey(plan.sourceRoot, plan.folder);
+      const key = projectMatchKey(sourceRoot, plan.folder);
       if (!claimReasons.has(key)) {
         claimReasons.set(key, { draft: plan.reason, savedOnce: true });
         importedReasons = true;
       }
     }
+    if (sourceRoot !== plan.sourceRoot) continue;
     if (!plan?.id || plan.version !== PLAN_VERSION || (!workspace && plan.sourceRoot !== SOURCE_ROOT) || plan.configurationRevision !== configurationRevision) continue;
     applyMemoryToPlan(plan);
     plans.set(plan.id, plan);
@@ -172,6 +176,8 @@ try {
     run.control.progress.uploads ||= [];
     run.control.progress.submission ||= { state: 'not_started' };
     run.sourceRoot ||= run.plan?.sourceRoot || SOURCE_ROOT;
+    run.sourceRoot = workspaceRecordRoot(annualSources, run.sourceRoot);
+    run.plan.sourceRoot = run.sourceRoot;
     run.configurationRevision ||= run.plan?.configurationRevision;
     run.control.autoSubmit = false;
     if (run.control.progress.submission.state === 'verified') {
@@ -351,6 +357,48 @@ function normalizeProjectMatch(match) {
 function projectMatchKey(root, folder) { return `${root}\0${folder}`; }
 function folderMemoryKey(root, folder) { return workspace ? projectMatchKey(root, folder) : folder; }
 
+function useWorkspaceRecordRoots() {
+  const recordRoot = (root) => workspaceRecordRoot(annualSources, root);
+  const rekey = (entries) => {
+    const updated = new Map(entries);
+    for (const [key, value] of entries) {
+      const separator = key.indexOf('\0');
+      if (separator < 0) continue;
+      const before = key.slice(0, separator);
+      const after = recordRoot(before);
+      if (before === after) continue;
+      updated.delete(key);
+      const target = after + key.slice(separator);
+      if (!updated.has(target)) updated.set(target, value);
+    }
+    return updated;
+  };
+  projectMatches = rekey(projectMatches);
+  claimReasons = rekey(claimReasons);
+  bookingOptions = rekey(bookingOptions);
+  fundingAttributions = rekey(fundingAttributions);
+  fundingWithdrawals = rekey(fundingWithdrawals);
+  for (const property of ['subjectByFolder', 'travelProfileByFolder', 'signerByClaim']) {
+    memory[property] = Object.fromEntries(rekey(Object.entries(memory[property])));
+  }
+  for (const record of [...claimGroups.values(), ...runs.values(), ...(history.withdrawals || [])]) {
+    if (!record.sourceRoot) continue;
+    const sourceRoot = recordRoot(record.sourceRoot);
+    if (sourceRoot === record.sourceRoot) continue;
+    record.sourceRoot = sourceRoot;
+    if (record.plan) record.plan.sourceRoot = sourceRoot;
+  }
+}
+
+async function saveWorkspaceRecordRoots() {
+  await Promise.all([
+    atomicJson(PROJECT_MATCHES_FILE, [...projectMatches]), atomicJson(CLAIM_REASONS_FILE, [...claimReasons]),
+    atomicJson(BOOKING_OPTIONS_FILE, [...bookingOptions]), atomicJson(FUNDING_ATTRIBUTIONS_FILE, [...fundingAttributions]),
+    atomicJson(FUNDING_WITHDRAWALS_FILE, [...fundingWithdrawals]), atomicJson(CLAIM_GROUPS_FILE, [...claimGroups.values()]),
+    atomicJson(HISTORY_FILE, history), saveMemory(DATA_APP_DIR, memory),
+  ]);
+}
+
 function claimGroupFor(root, key) {
   const group = claimGroups.get(key);
   return group?.sourceRoot === root ? group : null;
@@ -425,7 +473,7 @@ async function payrollPeopleFor(sourceRoot, category) {
 }
 
 async function fundingSnapshot(sourceRoot) {
-  const exports = await readFundingExports(sourceRoot);
+  const exports = await readFundingExports(sourceRoot, workspace?.year);
   if (demoMode) return { ...summarizeFunding({ exports, sourceRoot }), demoMode: true };
   const activeReceipts = [...runs.values()].filter((run) => !claimWithdrawalFor(history, run.id));
   const scope = `${sourceRoot}\0`;
@@ -446,6 +494,24 @@ function folderHasOpenRun(sourceRoot, folder) {
 function schoolBookingsFor(sourceRoot) {
   return [...runs.values()].filter((run) => run.sourceRoot === sourceRoot && run.bookkeeping?.appointmentRecorded &&
     run.plan.reimbursementRoute === 'legacy' && !claimWithdrawalFor(history, run.id));
+}
+
+async function receiptFolders(sourceRoot) {
+  const entries = await listFinalFolders(sourceRoot);
+  const paths = new Set(entries.map(({ path }) => path));
+  const submitted = new Set();
+  for (const run of runs.values()) {
+    if (run.sourceRoot !== sourceRoot || !isRecordedReimbursement(run) || claimWithdrawalFor(history, run.id)) continue;
+    for (const folder of reimbursementSourceFolders(run.plan)) {
+      if (!paths.has(`${folder}-已报销`) || run.plan.reimbursementRoute === 'legacy') submitted.add(folder);
+    }
+  }
+  for (const group of claimGroups.values()) {
+    if (group.sourceRoot === sourceRoot && group.status === 'submitted') {
+      for (const folder of group.folders) if (!paths.has(`${folder}-已报销`) || group.submission?.appointment) submitted.add(folder);
+    }
+  }
+  return entries.map((folder) => submitted.has(folder.path) ? { ...folder, reimbursed: true } : folder);
 }
 
 function appointmentSummary(run) {
@@ -741,12 +807,13 @@ async function recordSubmitted(run) {
     return;
   }
   try {
-    const reimbursedFolder = await markFolderReimbursed(run.plan, run.sourceRoot);
+    const external = [...annualSources.values()].some(({ sourceRoot }) => sourceRoot === run.sourceRoot);
+    const reimbursedFolder = external ? reimbursementSourceFolders(run.plan).join('、') : await markFolderReimbursed(run.plan, run.sourceRoot);
     run.bookkeeping.folderMarked = true;
     delete run.bookkeeping.renameError;
     run.events.push({ type: 'step', step: '标记已报销', status: 'completed', detail: reimbursedFolder, at: new Date().toISOString() });
     addMessage(run, 'assistant', run.plan.groupId ? `已核实“${planLabel(run.plan)}”提交结果，${run.plan.sourceFolders.length} 个来源文件夹已归入报销历史。` : `已核实本单提交结果，文件夹已标记为“${reimbursedFolder}”。`);
-    if (run.plan.groupId) await withWorklistWrite(async () => {
+    if (!external && run.plan.groupId) await withWorklistWrite(async () => {
       const group = claimGroupFor(run.sourceRoot, run.plan.folder);
       await saveGroup({ ...group, archivedFolders: run.plan.archivedFolders });
     });
@@ -844,6 +911,33 @@ async function publicConfig() {
     reviewArchiveAvailable: !demoMode && await hasReviewArchive(REVIEW_ARCHIVE_FILE).catch(() => false) };
 }
 
+function changeWorkspaceSource(input) {
+  return withWorklistWrite(async () => {
+    if (!workspace || workspace.example) throw httpError(409, '请先选择自己的使用人与年度。');
+    if (input.previousSourceRoot !== SOURCE_ROOT) throw httpError(409, '票据目录已变化，请刷新。');
+    if (browserReservation || heldRun() || schoolFundingSync.view(SOURCE_ROOT)?.active) {
+      throw httpError(409, '还有正在办理、待核实或同步的操作，请处理后再更改票据目录。');
+    }
+    const reservation = randomUUID();
+    reserveBrowser(reservation);
+    try {
+      const previous = SOURCE_ROOT;
+      const next = await saveWorkspaceSource(APP_DIR, workspace, input.sourceRoot).catch((error) => { throw httpError(400, error.message); });
+      if (next.sourceRoot === previous) return { ...await publicConfig(), changed: false };
+      annualSources = await readWorkspaceSources(DATA_APP_DIR);
+      for (const [id, plan] of plans) if (plan.sourceRoot === previous) plans.delete(id);
+      useWorkspaceRecordRoots();
+      workspace = next;
+      SOURCE_ROOT = liveSourceRoot = next.sourceRoot;
+      await atomicJson(CONFIG_FILE, { demoMode, sourceRoot: SOURCE_ROOT, liveSourceRoot, preferences, paymentCardLast4, configurationRevision });
+      await saveWorkspaceRecordRoots();
+      await savePlans();
+      await saveRuns();
+      return { ...await publicConfig(), changed: true };
+    } finally { releaseBrowser(reservation); }
+  });
+}
+
 function selectWorkspaceYear(selection) {
   return withWorklistWrite(async () => {
     const next = await resolveWorkspace(APP_DIR, selection);
@@ -854,6 +948,7 @@ function selectWorkspaceYear(selection) {
     }
     await atomicJson(CONFIG_FILE, { demoMode, sourceRoot: demoMode ? '' : next.sourceRoot, liveSourceRoot: next.sourceRoot,
       preferences, paymentCardLast4, configurationRevision });
+    annualSources = next.example ? new Map() : await readWorkspaceSources(DATA_APP_DIR);
     workspace = next;
     SOURCE_ROOT = liveSourceRoot = next.sourceRoot;
     return publicWorkspace(workspace);
@@ -877,7 +972,7 @@ function publicRun(run) {
   const submission = run.control.progress.submission;
   const question = pending.get(run.id);
   const draftNumber = run.control.progress.payroll?.financeFormId || booking?.pdfFinanceFormId;
-  const year = workspace ? basename(run.sourceRoot) : null;
+  const year = workspace ? [...annualSources].find(([, item]) => item.sourceRoot === run.sourceRoot)?.[0] || basename(run.sourceRoot) : null;
   return {
     id: run.id,
     ...(isWorkspaceYear(year) ? { year } : {}),
@@ -1341,7 +1436,7 @@ async function route(request, response) {
       const input = await body(request);
       const allowCreate = input?.create === true;
       try {
-        return json(response, 200, await requestWorkspaceProcess(process, 'open', { owner: input?.owner, year: input?.year, create: allowCreate }));
+        return json(response, 200, await requestWorkspaceProcess(process, 'open', { owner: input?.owner, year: input?.year, create: allowCreate, sourceRoot: input?.sourceRoot }));
       } catch (error) { throw httpError(409, error.message); }
     }
     throw httpError(405, '请从使用人与年度菜单操作。');
@@ -1393,6 +1488,9 @@ async function route(request, response) {
   if (request.method === 'GET' && url.pathname === '/api/config') {
     return json(response, 200, await publicConfig());
   }
+  if (request.method === 'POST' && url.pathname === '/api/workspace-source') {
+    return json(response, 200, await changeWorkspaceSource(await body(request)));
+  }
   if (request.method === 'POST' && url.pathname === '/api/config') {
     return withBrowserReservation(() => withWorklistWrite(async () => {
       const input = await body(request);
@@ -1443,9 +1541,10 @@ async function route(request, response) {
     if (demoMode) return json(response, 200, { sourceRoot: SOURCE_ROOT, folders: [], claims: [], signerNames: [], payrollCategories: [], payrollPositions: [], payrollExpenseItems: [], payrollSignerNames: {} });
     const sourceRoot = SOURCE_ROOT;
     const appointments = schoolBookingsFor(sourceRoot);
-    const bySource = new Map(appointments.flatMap((run) => (run.plan.sourceFolders || [run.plan.folder]).map((folder) => [folder, run])));
-    const entries = await listFinalFolders(sourceRoot);
-    const paths = new Set(entries.map((folder) => folder.path));
+    const bySource = new Map(appointments.flatMap((run) => reimbursementSourceFolders(run.plan).map((folder) => [folder, run])));
+    const folders = await receiptFolders(sourceRoot);
+    if (sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据目录已切换，请刷新。');
+    const paths = new Set(folders.map((folder) => folder.path));
     const reimbursements = new Map();
     for (const run of runs.values()) {
       if (run.sourceRoot !== sourceRoot || !isRecordedReimbursement(run) || run.plan.groupId ||
@@ -1454,10 +1553,9 @@ async function route(request, response) {
       const archive = `${original}-已报销`;
       reimbursements.set(paths.has(archive) ? archive : original, run);
     }
-    const folders = entries.map((folder) => bySource.has(folder.path) || reimbursements.has(folder.path) ? { ...folder, reimbursed: true } : folder);
     const groups = [...claimGroups.values()].filter((group) => group.sourceRoot === sourceRoot && group.status !== 'dissolved');
     const claimed = new Map(groups.flatMap((group) => group.folders.map((folder) => [folder, group])));
-    const archived = new Set(groups.flatMap((group) => [...(group.archivedFolders || []), ...(group.submission?.appointment ? group.folders : [])]));
+    const archived = new Set(groups.filter((group) => group.status === 'submitted').flatMap((group) => [...(group.archivedFolders || []), ...group.folders]));
     const claims = groups.map((group) => {
       const receiptRun = runs.get(group.submission?.runId);
       const submission = group.submission?.appointment && receiptRun ? { ...group.submission, ...appointmentSummary(receiptRun) }
@@ -1639,7 +1737,7 @@ async function route(request, response) {
       const sources = merging.length ? merging.flatMap((group) => group.folders) : input.folders;
       if (!Array.isArray(sources) || !sources.length || sources.some((folder) => typeof folder !== 'string') || new Set(sources).size !== sources.length) throw httpError(400, '请选择不重复的来源文件夹');
       const folders = [...sources].sort();
-      const available = await listFinalFolders(input.sourceRoot);
+      const available = await receiptFolders(input.sourceRoot);
       if (input.sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据根目录已变化，请刷新');
       if (folders.some((folder) => !available.some((item) => item.path === folder && !item.reimbursed)) ||
           schoolBookingsFor(SOURCE_ROOT).some((run) => (run.plan.sourceFolders || [run.plan.folder]).some((folder) => folders.includes(folder)))) throw httpError(409, '来源文件夹已变化或已经办理，请刷新');
@@ -1690,7 +1788,7 @@ async function route(request, response) {
       } else {
         const folders = input.folders;
         if (!Array.isArray(folders) || !folders.length || folders.some((folder) => typeof folder !== 'string') || new Set(folders).size !== folders.length) throw httpError(400, '请保留至少一个来源文件夹');
-        const available = await listFinalFolders(group.sourceRoot);
+        const available = await receiptFolders(group.sourceRoot);
         if (group.sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据根目录已变化，请刷新');
         if (folders.some((folder) => !available.some((item) => item.path === folder && !item.reimbursed))) throw httpError(409, '来源文件夹已变化或已经报销');
         if (folders.some((folder) => folderHasOpenRun(SOURCE_ROOT, folder))) throw httpError(409, '来源文件夹正在执行或等待核实');
@@ -1710,7 +1808,7 @@ async function route(request, response) {
     if (sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据根目录已变化，请刷新文件夹');
     if (typeof input.reason !== 'string' || input.reason.length > 500) throw httpError(400, '请填写 500 字以内的报销事由草稿');
     const group = claimGroupFor(sourceRoot, folder);
-    const available = group ? group.status === 'draft' : (await listFinalFolders(sourceRoot)).some((item) => item.path === folder && !item.reimbursed);
+    const available = group ? group.status === 'draft' : (await receiptFolders(sourceRoot)).some((item) => item.path === folder && !item.reimbursed);
     if (!available) throw httpError(409, '请选择当前清单中的待报销文件夹');
     const reasonDraft = normalizeClaimReason(input.reason);
     const saved = await saveClaimReason(sourceRoot, folder, reasonDraft, { explicit: input.explicit === true, expectedSources: input.sourceFolders });
@@ -1722,7 +1820,7 @@ async function route(request, response) {
     const { sourceRoot, folder } = input;
     if (sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据根目录已变化，请刷新文件夹');
     const group = claimGroupFor(sourceRoot, folder);
-    const available = group ? group.status === 'draft' : (await listFinalFolders(sourceRoot)).some((item) => item.path === folder && !item.reimbursed);
+    const available = group ? group.status === 'draft' : (await receiptFolders(sourceRoot)).some((item) => item.path === folder && !item.reimbursed);
     if (!available) throw httpError(409, '请选择当前清单中的待报销文件夹');
     return json(response, 200, { match: await saveProjectMatch(sourceRoot, folder, input.match, input.importOnly === true) });
   }
@@ -1745,7 +1843,7 @@ async function route(request, response) {
       if (request.headers['content-type']?.split(';')[0].trim() !== 'application/json') throw httpError(415, '请通过报销汇总页面操作同步。');
       const sourceRoot = SOURCE_ROOT;
       if (request.method === 'DELETE') return json(response, 200, { job: schoolFundingSync.stop(sourceRoot) });
-      const { year } = await readFundingExports(sourceRoot);
+      const { year } = await readFundingExports(sourceRoot, workspace?.year);
       if (sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据目录已切换，请重新同步。');
       return json(response, 202, { job: schoolFundingSync.start(sourceRoot, year) });
     }
@@ -1753,7 +1851,7 @@ async function route(request, response) {
   if (request.method === 'GET' && url.pathname === '/api/funding-summary/source') {
     const sourceRoot = SOURCE_ROOT;
     const file = url.searchParams.get('file');
-    const { sources } = await readFundingExports(sourceRoot);
+    const { sources } = await readFundingExports(sourceRoot, workspace?.year);
     if (sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据目录已切换，请刷新报销汇总。');
     if (!sources.some((source) => source.file === file && source.state === 'read' &&
         (['smart', 'legacy', 'labor'].includes(source.kind) || (demoMode && source.kind === 'budget')))) {
@@ -1784,7 +1882,7 @@ async function route(request, response) {
           throw httpError(409, '本机有这笔执行记录，请从「已办理」登记撤回。');
         }
         if (!updated.has(key)) {
-          const { records } = await readFundingExports(sourceRoot);
+          const { records } = await readFundingExports(sourceRoot, workspace?.year);
           const rows = records.filter((record) => documentNumber(record.financeId) === financeId && ['smart', 'legacy'].includes(record.kind));
           if (!rows.some(({ state }) => state === 'pending') || rows.some(({ state }) => state === 'booked')) {
             throw httpError(409, '年度学校导出表中没有可登记撤回的待入账单据。');
@@ -1830,10 +1928,16 @@ async function route(request, response) {
   if (request.method === 'POST' && url.pathname === '/api/plans') {
     const input = await body(request);
     if (typeof input.folder !== 'string' || !input.folder.trim()) throw httpError(400, '请选择票据文件夹');
+    if (input.sourceRoot !== undefined && input.sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据根目录已变化，请刷新。');
     if (isReimbursedFolder(input.folder)) throw httpError(409, '该文件夹已报销，已移入历史清单');
     if (schoolBookingsFor(SOURCE_ROOT).some((run) => (run.plan.sourceFolders || [run.plan.folder]).includes(input.folder))) throw httpError(409, '该文件夹已有学校预约回执');
     const group = claimGroupFor(SOURCE_ROOT, input.folder);
+    if (input.previewOnly === true && group) throw httpError(400, '请从来源文件夹预览金额');
     if (group && group.status !== 'draft') throw httpError(409, '该报销事项已结束');
+    if (!group && [...runs.values()].some((run) => run.sourceRoot === SOURCE_ROOT && isRecordedReimbursement(run) &&
+        !claimWithdrawalFor(history, run.id) && reimbursementSourceFolders(run.plan).includes(input.folder))) {
+      throw httpError(409, '该文件夹已报销，已移入历史清单');
+    }
     if (group?.payroll) throw httpError(400, '请从薪酬申报表打开本笔事项');
     if (group?.didi) throw httpError(400, '贸大出行的票据在执行时从学校票夹选取');
     if (input.folder.startsWith('@事项/') && !group) throw httpError(404, '报销事项不存在');
@@ -1859,8 +1963,10 @@ async function route(request, response) {
       if (reason?.savedOnce && reason.fingerprint === plan.fingerprint && reason.draft && project?.projectNo && project?.projectName) {
         plan = confirmClaimPurpose(plan, { reason: reason.draft, confirmed: true });
       }
-      storeCurrentPlan(plan, sourceRoot, revision);
-      await savePlans();
+      if (input.previewOnly !== true) {
+        storeCurrentPlan(plan, sourceRoot, revision);
+        await savePlans();
+      }
       return json(response, 200, { plan: publicPlan(plan), match });
     });
   }

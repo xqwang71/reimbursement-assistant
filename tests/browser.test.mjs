@@ -26,6 +26,7 @@ let browser;
 let server;
 let origin;
 let uiChecks = 0;
+let uiSourceRefresh;
 let uiExecuteRequests = 0;
 let uiPurposePayload;
 let uiPreparedPlan;
@@ -216,7 +217,7 @@ test.before(async () => {
       if (request.url === '/api/config') return json({ sourceRoot: uiSourceRoot, defaultSourceRoot: uiSourceRoot, paymentCardConfigured: true });
       if (request.url === '/api/projects') return json({ projects: uiProjects.map(({ projectNo, projectName }) => ({ projectNo, projectName })), syncedAt: null });
       if (request.url === '/api/projects/sync') return json({ projects: uiProjects, syncedAt: '2026-11-10T01:00:00Z' });
-      if (request.url === '/api/folders') return json({ sourceRoot: uiSourceRoot, signerNames: uiSignerNames, folders: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...[uiFolder, uiSecondFolder].map(path => ({ path, fileCount: 3, reimbursed: false, claimKey: uiGroup?.key, claimLabel: uiGroup?.name }))], claims: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...(uiGroup ? [{ path: uiGroup.key, groupId: uiGroup.id, label: uiGroup.name, sourceFolders: uiGroup.folders, subject: '办公用品', fileCount: 6, reimbursed: false, match: uiMatch, reasonDraft: uiReasonDraft, reasonSaved: uiReasonSaved, offlineBooking: uiGroup.bookingOptions?.offline === true }] : [])] });
+      if (request.url === '/api/folders') return json({ sourceRoot: uiSourceRoot, signerNames: uiSignerNames, folders: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...[uiFolder, uiSecondFolder].map(path => ({ path, fileCount: uiSourceRefresh && path === uiFolder ? 4 : 3, reimbursed: false, claimKey: uiGroup?.key, claimLabel: uiGroup?.name }))], claims: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...(uiGroup ? [{ path: uiGroup.key, groupId: uiGroup.id, label: uiGroup.name, sourceFolders: uiGroup.folders, subject: '办公用品', fileCount: 6, reimbursed: false, match: uiMatch, reasonDraft: uiReasonDraft, reasonSaved: uiReasonSaved, offlineBooking: uiGroup.bookingOptions?.offline === true }] : [])] });
       if (request.url === '/api/claim-groups') {
         const input = await payload(request);
         assert.deepEqual(input.folders.sort(), [uiFolder, uiSecondFolder].sort());
@@ -266,6 +267,10 @@ test.before(async () => {
       if (request.url === '/api/login-status') return json({ loggedIn: true, message: '本地模拟页面' });
       if (request.url === '/api/plans') {
         const input = await payload(request);
+        if (uiSourceRefresh && input.folder === uiFolder) {
+          await uiSourceRefresh;
+          return json({ plan: { ...uiPlan(), folder: input.folder, totalCny: 3850, invoiceTotalCny: 5000, fingerprint: 'fixture-updated', cacheState: 'new' } });
+        }
         if ([uiFolder, uiSecondFolder].includes(input.folder)) return json({ plan: { ...uiPlan(), folder: input.folder, totalCny: 4938, invoiceTotalCny: 5000 } });
         uiChecks += 1;
         assert.equal(input.folder, uiGroupKey);
@@ -2110,6 +2115,24 @@ test('the worklist groups source folders before saving purpose, matching funding
   await page.locator('#refreshFolders').click();
   await rechecked;
   assert.ok(uiChecks > checksBeforeRefresh);
+  await page.locator('#folderRefreshStatus').filter({ hasText: '刷新完成' }).waitFor();
+  const sourceRow = page.locator('.source-row').filter({ has: page.getByRole('checkbox', { name: `选择来源 ${uiFolder}`, exact: true }) });
+  assert.equal(await page.locator('#receiptDirectory').textContent(), uiSourceRoot);
+  assert.match(await sourceRow.innerText(), /49\.38/);
+  const refresh = Promise.withResolvers();
+  uiSourceRefresh = refresh.promise;
+  try {
+    await page.locator('#refreshFolders').click();
+    await sourceRow.getByText(/4 个文件/).waitFor();
+    assert.equal(await page.locator('#refreshFolders').isDisabled(), true);
+    assert.match(await page.locator('#folderRefreshStatus').innerText(), /正在核对/);
+    refresh.resolve();
+    await sourceRow.getByText(/38\.50/).waitFor();
+    await page.locator('#folderRefreshStatus').filter({ hasText: '1 个有新材料或文件变化' }).waitFor();
+  } finally {
+    refresh.resolve();
+    uiSourceRefresh = null;
+  }
   const alignment = await page.evaluate(() => {
     const panes = [...document.querySelectorAll('.match-pane')];
     return panes.map((pane) => {
