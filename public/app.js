@@ -72,16 +72,41 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => 
 const itemFor = (folder) => state.folders.find((item) => item.path === folder);
 const displayNameFor = (folder) => itemFor(folder)?.label || folder;
 
+function recognizedPaymentTotal(plan) {
+  return plan?.paymentCandidates?.length
+    ? plan.paymentCandidates.reduce((total, { amountCny }) => total + amountCny, 0)
+    : null;
+}
+
+function paymentReviewNeeded(plan) {
+  if (!plan?.paymentCandidates?.length || !plan.rows.length) return false;
+  const linked = new Set(plan.rows.flatMap((row) => row.paymentFiles || []));
+  return plan.rows.some((row) => !row.paymentFiles?.length) || plan.paymentCandidates.some(({ name }) => !linked.has(name));
+}
+
 function renderSources() {
   const pending = state.sourceFolders.filter((item) => !item.reimbursed);
   const keyword = $('sourceFilter').value.trim().toLowerCase();
   $('sourceCount').textContent = `${pending.filter((item) => !item.claimKey).length} 个可合并`;
   $('sourceRows').innerHTML = pending.filter((item) => item.path.toLowerCase().includes(keyword)).map((item) => {
-    const amount = state.sourceAmounts.get(item.path);
-    const invoices = amount?.invoiceTotalCny > 0 ? `发票 ${money(amount.invoiceTotalCny)}` : '';
-    const payment = amount?.singlePaymentCny > 0 ? `识别到实付 ${money(amount.singlePaymentCny)} · 待确认对应关系` : '实付待核对';
-    const value = amount?.error ? `识别失败 · ${amount.error}` : Number.isSafeInteger(amount?.totalCny) ? `核定 ${money(amount.totalCny)}`
-      : invoices ? `${invoices} · ${payment}` : amount ? '未识别到有效发票' : '金额待核对';
+    const preview = state.sourceAmounts.get(item.path);
+    const claim = state.plans.get(item.claimKey);
+    const merged = claim?.sourceFolders?.length > 1;
+    const amount = claim && !merged ? claim : preview;
+    const recognized = amount?.recognizedPaymentCny ?? recognizedPaymentTotal(amount);
+    let value = '金额待核对';
+    if (merged) {
+      value = Number.isSafeInteger(preview?.totalCny) ? `来源预估 ${money(preview.totalCny)} · 见合并事项` : '见合并事项核对结果';
+    } else if (amount?.error) {
+      value = `识别失败 · ${amount.error}`;
+    } else if (Number.isSafeInteger(amount?.totalCny) && !paymentReviewNeeded(claim)) {
+      value = `核定 ${money(amount.totalCny)}`;
+    } else if (amount) {
+      const invoices = amount.invoiceTotalCny > 0 ? `发票 ${money(amount.invoiceTotalCny)}` : '未识别到有效发票';
+      const payment = recognized > 0 ? `识别到付款 ${money(recognized)}` : '实付待核对';
+      value = `${invoices} · ${payment}`;
+      if (amount.invoiceTotalCny > 0 && recognized > 0 && (!claim || paymentReviewNeeded(claim))) value += ' · 待确认对应关系';
+    }
     return `<label class="source-row${item.claimKey ? ' is-assigned' : ''}"><input type="checkbox" data-source="${escapeHtml(item.path)}" aria-label="选择来源 ${escapeHtml(item.path)}" ${state.selectedSources.has(item.path) ? 'checked' : ''} ${item.claimKey ? 'disabled' : ''}><strong>${escapeHtml(item.path)}</strong><small>${item.fileCount} 个文件 · ${escapeHtml(value)}</small>${item.claimKey ? `<small>已加入 ${escapeHtml(item.claimLabel)}</small>` : ''}</label>`;
   }).join('') || '<p class="muted">没有符合条件的来源文件夹。</p>';
   const selection = state.selectedSources.size ? `已勾选 ${state.selectedSources.size} 个来源文件夹` : '';
@@ -220,8 +245,10 @@ async function prepareSource(item, generation) {
   try {
     const { plan } = await api('/api/plans', { method: 'POST', body: JSON.stringify({ sourceRoot: state.sourceRoot, folder: item.path, subject: config.subject, funding: config.funding, project: null, previewOnly: true }) });
     if (generation !== state.configurationGeneration) return;
-    const singlePaymentCny = plan.paymentCandidates?.length === 1 ? plan.paymentCandidates[0].amountCny : null;
-    state.sourceAmounts.set(item.path, { totalCny: plan.totalCny, invoiceTotalCny: plan.invoiceTotalCny, singlePaymentCny, fingerprint: plan.fingerprint, cacheState: plan.cacheState });
+    state.sourceAmounts.set(item.path, {
+      totalCny: plan.totalCny, invoiceTotalCny: plan.invoiceTotalCny, recognizedPaymentCny: recognizedPaymentTotal(plan),
+      fingerprint: plan.fingerprint, cacheState: plan.cacheState,
+    });
     renderSources();
   } catch (error) {
     if (generation !== state.configurationGeneration) return;
@@ -424,7 +451,11 @@ function updateRowInPlace(folder) {
     if (row.querySelector('.reason-action')) updateReasonInPlace(folder, row);
     updateAllocationInPlace(folder, row);
     const details = row.querySelector('.detail-row');
-    if (details) details.disabled = !state.plans.has(folder);
+    if (details) {
+      const plan = state.plans.get(folder);
+      details.disabled = !plan;
+      details.textContent = paymentReviewNeeded(plan) ? '核对发票和付款' : '详情';
+    }
     const amount = folderAmount(folder);
     row.querySelector('.folder-amount').textContent = amount.value;
     row.querySelector('.folder-amount-label').textContent = amount.label;
@@ -481,11 +512,11 @@ function renderMaterialReview(plan) {
     return `<label>发票 ${escapeHtml(row.invoiceNumber)} 的实付金额（元）<input type="number" min="0.01" step="0.01" inputmode="decimal" data-paid-invoice="${escapeHtml(row.invoiceNumber)}" value="${Number.isSafeInteger(value) ? (value / 100).toFixed(2) : ''}"></label>`;
   }).join('');
   const payments = plan.paymentCandidates || [];
-  const paymentFields = payments.length && plan.rows.length ? `<details class="funding-data">
+  const paymentFields = payments.length && plan.rows.length ? `<details id="paymentReview" class="funding-data" ${paymentReviewNeeded(plan) ? 'open' : ''}>
     <summary>核对发票对应的付款凭证</summary>
-    <p class="muted">按发票勾选实际对应的付款，可选多笔。保存前请核对金额、日期和交易明细。</p>
+    <p class="muted">按发票勾选实际对应的付款，可选多笔。核对金额、日期和交易明细后点「保存核对结果」，助手会按发票与对应实付金额的较小值计算。</p>
     ${plan.rows.map((row) => `<fieldset data-invoice-payments="${escapeHtml(row.invoiceNumber)}">
-      <legend>${escapeHtml(plan.fileSources?.[row.invoiceFile]?.folder || row.invoiceFile)} · 发票 ${escapeHtml(row.invoiceNumber)} · ${money(row.invoiceAmountCny)}</legend>
+      <legend>${escapeHtml(plan.fileSources?.[row.invoiceFile]?.folder || row.invoiceFile)} · 发票 ${escapeHtml(row.invoiceNumber)} · ${money(row.invoiceAmountCny)}${row.date ? ' · ' + escapeHtml(row.date) : ''}</legend>
       ${payments.map(({ name, amountCny, date }) => `<label class="checkbox-row"><input type="checkbox" value="${escapeHtml(name)}" ${row.paymentFiles.includes(name) ? 'checked' : ''}>${escapeHtml(plan.fileSources?.[name]?.name || name)} · ${money(amountCny)}${date ? ' · ' + escapeHtml(date) : ''}${plan.fileSources?.[name] ? ' · ' + escapeHtml(plan.fileSources[name].folder) : ''}</label>`).join('')}
     </fieldset>`).join('')}
   </details>` : '';
@@ -501,14 +532,18 @@ function renderMaterialReview(plan) {
 }
 
 async function saveMaterialReview() {
-  const plan = state.plans.get(state.detailFolder);
+  const folder = state.detailFolder;
+  const plan = state.plans.get(folder);
   if (!plan) return;
+  const generation = state.configurationGeneration;
+  const status = $('materialStatus');
+  const button = $('saveMaterials');
   const paidAmountsCny = {};
   for (const input of $('detailContent').querySelectorAll('[data-paid-invoice]')) {
     if (!input.value && !input.validity.badInput) continue;
     const amount = Math.round(Number(input.value) * 100);
     if (!input.validity.valid || !Number.isSafeInteger(amount) || amount <= 0) {
-      $('materialStatus').textContent = '请输入大于零的实付金额，最多两位小数。';
+      status.textContent = '请输入大于零的实付金额，最多两位小数。';
       input.focus();
       return;
     }
@@ -524,14 +559,24 @@ async function saveMaterialReview() {
   }
   const payload = { fingerprint: plan.fingerprint, receiptFile: $('confirmReceipt')?.value, assetFile: $('confirmAsset')?.value, sealedDetailFile: $('confirmSeal')?.value, paymentCardConfirmed: $('confirmCard').checked, governmentProcurement: $('confirmGovernmentProcurement')?.checked === true, paidAmountsCny,
     ...(Object.keys(paymentLinks).length ? { paymentLinks } : {}) };
-  $('saveMaterials').disabled = true;
+  button.disabled = true;
+  status.textContent = '正在保存核对结果…';
   try {
-    const result = await api(`/api/plans/${plan.id}/confirmations`, { method: 'POST', body: JSON.stringify(payload) });
-    storeCheckedPlan(result.plan);
+    const { plan: saved } = await api(`/api/plans/${plan.id}/confirmations`, { method: 'POST', body: JSON.stringify(payload) });
+    if (generation !== state.configurationGeneration) return;
+    storeCheckedPlan(saved);
     renderRows();
-    renderDetailModal();
-  } catch (error) { $('materialStatus').textContent = error.message; }
-  finally { if ($('saveMaterials')) $('saveMaterials').disabled = false; }
+    const message = paymentReviewNeeded(saved) ? '核对结果已保存。请继续核对尚未关联的发票或付款。'
+      : Number.isSafeInteger(saved.totalCny) ? `核对结果已保存，核定报销 ${money(saved.totalCny)}。` : '核对结果已保存。请查看剩余金额核对事项。';
+    if ($('executionDetails').dataset.folder === folder) $('executionFeedback').hidden = true;
+    setWorklistStatus(message);
+    if (state.detailFolder === folder) {
+      renderDetailModal();
+      $('materialStatus').textContent = message;
+      $('materialStatus').scrollIntoView({ block: 'nearest' });
+    }
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
 }
 
 function reasonEntry(folder) {
@@ -682,6 +727,9 @@ async function lookupForeignQuote(button) {
 }
 
 function renderPlanDetails(plan) {
+  const recognized = recognizedPaymentTotal(plan);
+  const showRecognized = recognized !== null && (paymentReviewNeeded(plan) || !Number.isSafeInteger(plan.paidTotalCny));
+  const reviewSource = plan.uploadSource === 'ai' ? '模型复核' : plan.uploadSource === 'ai-cache' ? '模型复核结果已缓存' : '本机规则';
   const currentReason = plan.reason && cleanReason(reasonEntry(plan.folder).text) === plan.reason ? plan.reason : '';
   const ready = plan.status === 'ready' && currentReason;
   const labor = plan.subject === '劳务费';
@@ -708,7 +756,7 @@ function renderPlanDetails(plan) {
   const signerOptions = signerNames.map((name) => `<option value="${escapeHtml(name)}" ${plan.signer?.name === name ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('');
   return `<div class="plan">
     <section class="detail-section"><h3>办理系统</h3><p>${routeLabel}</p></section>
-    ${labor ? '' : `<div class="metrics"><div class="metric"><small>发票总额</small><strong>${money(plan.invoiceTotalCny)}</strong></div><div class="metric"><small>实付总额</small><strong>${money(plan.paidTotalCny)}</strong></div><div class="metric"><small>核定报销</small><strong>${money(plan.totalCny)}</strong></div></div>`}
+    ${labor ? '' : `<div class="metrics"><div class="metric"><small>发票总额</small><strong>${money(plan.invoiceTotalCny)}</strong></div><div class="metric"><small>${showRecognized ? '已识别付款' : '已关联实付'}</small><strong>${money(showRecognized ? recognized : plan.paidTotalCny)}</strong></div><div class="metric"><small>核定报销</small><strong>${money(plan.totalCny)}</strong></div></div>`}
     <section class="detail-section"><h3>报销事由</h3><p class="muted">${currentReason ? `${offline ? '' : '学校页面填写内容 '}${escapeHtml(currentReason)}` : '请在报销事项中填写事由，再点击保存或更新。'}</p></section>
     ${plan.sourceFolders ? `<section class="detail-section"><h3>来源文件夹</h3><ul>${plan.sourceFolders.map((folder) => `<li>${escapeHtml(folder)}</li>`).join('')}</ul><p class="muted">合并检查 ${plan.sourceFolders.length} 个文件夹，共用一笔报销事由和经费项目。</p></section>` : ''}
     <div class="edit-grid">
@@ -723,7 +771,7 @@ function renderPlanDetails(plan) {
         <label>本笔加签人工号（可选）<input id="editSignerCode" type="text" maxlength="30" autocomplete="off" value="${escapeHtml(plan.signer?.employeeNo || '')}"></label>`}
     </div>
     <div class="edit-actions"><button id="savePlanEdit" class="secondary" type="button">保存设置</button><span id="editStatus" class="muted"></span></div>
-    ${offline ? '' : `<dl><dt>费用类型特例</dt><dd>${plan.expenseTypeRules?.length ? escapeHtml(plan.expenseTypeRules.map((rule) => `${rule.keyword}→${rule.type}`).join('、')) : '无'}</dd><dt>票据</dt><dd>${plan.rows.length} 张发票，${plan.uploadFiles.length} 个上传文件（${plan.uploadSource === 'ai' ? 'AI 选定' : plan.uploadSource === 'ai-cache' ? 'AI 选定·缓存' : '规则选定'}），分 ${plan.batches.length} 批</dd><dt>检查状态</dt><dd>${plan.cacheState === 'cached' ? '文件夹无变化，复用缓存' : '已重新识别更新内容'}</dd></dl>`}
+    ${offline ? '' : `<dl><dt>费用类型特例</dt><dd>${plan.expenseTypeRules?.length ? escapeHtml(plan.expenseTypeRules.map((rule) => `${rule.keyword}→${rule.type}`).join('、')) : '无'}</dd><dt>票据</dt><dd>${plan.rows.length} 张发票，${plan.uploadFiles.length} 个上传文件（${reviewSource}），分 ${plan.batches.length} 批</dd><dt>检查状态</dt><dd>${plan.cacheState === 'cached' ? '本机取字结果已缓存' : '已读取新增或更新的附件'}。</dd></dl>`}
     <div class="${ready ? 'muted' : 'warnings'}"><strong>${executionLabel}</strong>${plan.blockers?.length ? `<ul>${plan.blockers.map((message) => `<li>${escapeHtml(message)}</li>`).join('')}</ul>` : ''}</div>
     ${warnings}
     ${renderMaterialReview(plan)}
@@ -736,9 +784,11 @@ function renderPlanDetails(plan) {
 }
 
 function openDetails(folder) {
-  if (!state.plans.has(folder)) return;
+  const plan = state.plans.get(folder);
+  if (!plan) return;
   state.detailFolder = folder;
   renderDetailModal();
+  if (paymentReviewNeeded(plan)) $('paymentReview').querySelector('summary').focus();
 }
 
 function closeDetails() {
@@ -877,6 +927,11 @@ function allocationState(folder) {
   const draft = projects.length > 1 ? [...fields.map(({ projectNo, projectName, amountCny }) => ({ projectNo, projectName, amountCny })), { ...projects.at(-1), amountCny: null }] : projects;
   const amount = state.amounts.get(folder) || {};
   const result = allocateProjects(draft, amount.totalCny);
+  if (result.error && !Number.isSafeInteger(amount.totalCny)) {
+    const plan = state.plans.get(folder);
+    result.error = paymentReviewNeeded(plan) ? '请先核对发票和付款并保存。助手会计算核定报销额。'
+      : plan?.blockers?.[0] || '请先完成材料核对。';
+  }
   return { ...result, draft, fields, amount, dirty: fields.some((field) => field.dirty), saving: savingMatches.has(key) };
 }
 
@@ -1070,7 +1125,7 @@ function renderRows() {
       <div class="folder-actions">
         <button class="secondary match-row" type="button" aria-label="匹配经费 ${label}" aria-pressed="${current}">匹配经费</button>
         ${item.didi ? '<button class="secondary" type="button" data-edit-didi>修改预算</button><button class="text-button" type="button" data-remove-didi>移除</button>'
-          : `<button class="secondary detail-row" type="button" ${plan ? '' : 'disabled'}>详情</button>`}
+          : `<button class="secondary detail-row" type="button" ${plan ? '' : 'disabled'}>${paymentReviewNeeded(plan) ? '核对发票和付款' : '详情'}</button>`}
       </div>
       ${item.didi ? '' : renderClaimSources(item)}
       ${renderReasonForm(folder)}
@@ -1183,7 +1238,10 @@ async function prepareFolder(folder) {
       }
       storeCheckedPlan(plan);
       if (matchUpdated || $('claimRouteFilter').value) renderRows();
-      else updateRowInPlace(folder);
+      else {
+        updateRowInPlace(folder);
+        if (plan.sourceFolders?.length) renderSources();
+      }
       return plan.status === 'ready';
     } catch (error) {
       if (config.version === version && generation === state.configurationGeneration) {
@@ -1267,7 +1325,8 @@ function showExecutionFeedback(message, { blocked = true, folder = '', focusReas
   details.dataset.folder = folder;
   details.dataset.openRun = String(openRun);
   details.dataset.allocation = String(allocation);
-  details.textContent = openRun ? '查看执行进度' : allocation ? '查看分配' : '查看详情';
+  details.textContent = openRun ? '查看执行进度' : allocation ? '查看分配'
+    : paymentReviewNeeded(state.plans.get(folder)) ? '核对发票和付款' : '查看详情';
   details.hidden = !openRun && !allocation && (!folder || !state.plans.has(folder));
   if (!blocked || !reveal) return;
   feedback.scrollIntoView({ block: 'nearest' });
@@ -1312,6 +1371,23 @@ async function executeSelected() {
     showExecutionFeedback(`${incomplete.label} · ${(incomplete.payroll || incomplete.didi).blocker || '请先保存或更新用车事由'}`, { folder: incomplete.path, focusReason: Boolean(incomplete.didi && incomplete.match) });
     return;
   }
+  const missing = folders.filter((folder) => !state.plans.has(folder));
+  if (missing.length) {
+    showExecutionFeedback(`尚未启动。以下事项需要先检查材料。\n${missing.map(displayNameFor).join('、')}`);
+    return;
+  }
+  const pendingAmounts = folders.filter((folder) => {
+    const plan = state.plans.get(folder);
+    return paymentReviewNeeded(plan) || (plan.status !== 'ready' && !Number.isSafeInteger(plan.totalCny));
+  });
+  if (pendingAmounts.length) {
+    const messages = pendingAmounts.map((folder) => {
+      const plan = state.plans.get(folder);
+      return `${displayNameFor(folder)} · ${plan.blockers?.[0] || '请查看金额核对结果'}`;
+    });
+    showExecutionFeedback(`尚未启动。请先核对以下事项的材料和金额。\n${messages.join('\n')}`, { folder: pendingAmounts[0] });
+    return;
+  }
   const unmatched = folders.filter((folder) => !projectForFolder(folder));
   if (unmatched.length) {
     showExecutionFeedback(`请先为以下报销事项匹配经费项目。\n${unmatched.map(displayNameFor).join('、')}`, { folder: unmatched[0] });
@@ -1325,11 +1401,6 @@ async function executeSelected() {
   if (unallocated.length) {
     const messages = unallocated.map((folder) => `${displayNameFor(folder)} · ${allocationState(folder).error || '请先保存经费分配'}`);
     showExecutionFeedback(`请先完成中栏的经费分配。\n${messages.join('\n')}`, { folder: unallocated[0], allocation: true });
-    return;
-  }
-  const missing = folders.filter((folder) => !state.plans.has(folder));
-  if (missing.length) {
-    showExecutionFeedback(`尚未启动。以下文件夹需要先完成核对。\n${missing.join('、')}`);
     return;
   }
   const editedReasons = folders.filter((folder) => {
@@ -1893,8 +1964,12 @@ async function refreshFoldersManually() {
       return amount.fingerprint && (prior ? prior !== amount.fingerprint : amount.cacheState === 'new' || amount.cacheState === 'refreshed');
     }).length;
     const failed = results.filter(([, amount]) => amount.error).length;
-    const awaiting = results.filter(([, amount]) => !amount.error && !Number.isSafeInteger(amount.totalCny)).length;
-    status.textContent = `刷新完成。核对 ${results.length} 个来源文件夹，${updated} 个有新材料或文件变化。${awaiting ? `${awaiting} 个金额待核对。` : ''}${failed ? `${failed} 个识别失败，详情见对应文件夹。` : ''}`;
+    const awaitingSources = state.sourceFolders.filter((item) => {
+      const preview = state.sourceAmounts.get(item.path);
+      return !item.claimKey && preview && !preview.error && !Number.isSafeInteger(preview.totalCny);
+    }).length;
+    const awaitingClaims = [...state.plans.values()].filter((plan) => paymentReviewNeeded(plan) || !Number.isSafeInteger(plan.totalCny)).length;
+    status.textContent = `刷新完成。核对 ${results.length} 个来源文件夹，${updated} 个有新材料或文件变化。${awaitingSources ? `${awaitingSources} 个未合并的来源金额待核对。` : ''}${awaitingClaims ? `${awaitingClaims} 个报销事项待核对材料或金额。` : ''}${failed ? `${failed} 个识别失败，详情见对应文件夹。` : ''}`;
   } catch (error) {
     status.textContent = `刷新失败。${error.message}`;
   } finally {

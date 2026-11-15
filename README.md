@@ -42,6 +42,8 @@ npm run launch -- --install-ocr
 
 OCR 在本机运行。四个外部模型场景默认关闭。关闭时仍可读 Excel、做汇总及使用本机规则核对材料。需要提取新差旅行程时，可在设置中单独开启「差旅核对」。姓名不参与模型提取，关联学校出差申请时按页面提示核对单号。
 
+在设置的「使用场景」为「附件识别」选择模型后，助手会根据本机提取的整批附件文字复核材料类别及付款与发票的对应关系。详情会标明使用了本机规则、模型复核还是已有的模型结果。关联待核对时，可在详情中勾选各张发票对应的付款凭证，点「保存核对结果」。普通人民币报销按每张发票金额与对应实付金额的较小值计算，再汇总用于经费分配。
+
 可使用本机的 ChatGPT / Codex 登录，也可配置第三方模型，例如 DeepSeek API。两种方式都需要安装本机 Codex CLI。Windows 如需手动指定 Codex，将 `CODEX_BIN` 设为 `codex.exe` 的完整路径。
 
 使用 DeepSeek 时，在 `owner/<使用人>/.env` 中设置 `DEEPSEEK_API_KEY`，退出并重启助手。在「连接与凭据」选择「DeepSeek API」，再在「使用场景」为需要开启的功能选择 DeepSeek 并保存。助手设置中填写的是环境变量名，可使用「添加连接」接入其他兼容 OpenAI Responses API 的服务。DeepSeek 的接口和模型名称见 [DeepSeek 官方文档](https://api-docs.deepseek.com/guides/responses_api/)。

@@ -945,6 +945,66 @@ test('the foreign claim detail updates its total after saving the selected quote
   assert.match(await page.locator('.metrics').innerText(), /核定报销\s*¥96\.16/);
 });
 
+test('a recognized payment can be linked before funding allocation and stays visible after refresh', async (t) => {
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  const match = { funding: '教学', allocations: projectFixture.map((project) => ({ ...project, amountCny: null })) };
+  const claim = { path: uiGroupKey, groupId: uiPlan().groupId, label: uiFolder, sourceFolders: [uiFolder], subject: '办公用品', fileCount: 2, match };
+  const source = { path: uiFolder, fileCount: 2, claimKey: uiGroupKey, claimLabel: claim.label };
+  const evidence = { name: '模拟银行明细.png', amountCny: 9876, date: '2026-07-08' };
+  let saved = false;
+  let executions = 0;
+  const planFor = (folder) => {
+    const linked = saved && folder === uiGroupKey;
+    return {
+      ...uiPlan(), folder, sourceFolders: folder === uiGroupKey ? [uiFolder] : undefined,
+      project: projectFixture[0], reimbursementRoute: 'smart', status: 'blocked', reason,
+      blockers: [linked ? '请填写每个手动分配项目的金额' : '已识别付款 98.76 元，请确认对应发票'],
+      rows: [{ invoiceNumber: number, invoiceAmountCny: 10000, invoiceFile: '发票.pdf',
+        paymentFiles: linked ? [evidence.name] : [], paidAmountCny: linked ? 9876 : null }],
+      paymentCandidates: [evidence], totalCny: linked ? 9876 : null, paidTotalCny: linked ? 9876 : null,
+    };
+  };
+  await context.route('**/*', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.origin !== origin) return route.abort();
+    if (url.pathname === '/api/folders') return route.fulfill({ json: { sourceRoot: uiSourceRoot, folders: [source], claims: [claim] } });
+    if (url.pathname === '/api/plans') {
+      const { folder } = route.request().postDataJSON();
+      return route.fulfill({ json: { plan: planFor(folder), match } });
+    }
+    if (url.pathname === `/api/plans/${uiPlan().id}/confirmations`) {
+      assert.deepEqual(route.request().postDataJSON().paymentLinks, { [number]: [evidence.name] });
+      saved = true;
+      return route.fulfill({ json: { plan: planFor(uiGroupKey) } });
+    }
+    if (url.pathname === '/api/batch-runs' && route.request().method() === 'POST') {
+      executions += 1;
+      return route.fulfill({ status: 409, json: { error: '材料待核对' } });
+    }
+    return route.continue();
+  });
+  const page = await context.newPage();
+  await page.goto(`${origin}/runner`);
+  const sourceRow = page.locator('.source-row', { hasText: uiFolder });
+  await sourceRow.getByText(/识别到付款 ¥98\.76 · 待确认对应关系/).waitFor();
+  await page.locator('.allocation-status', { hasText: '请先核对发票和付款并保存' }).waitFor();
+  await page.locator('.row-select').check();
+  await page.locator('#executeSelected').click();
+  assert.match(await page.locator('#executionStatus').innerText(), /已识别付款 98\.76 元/);
+  await page.locator('#executionDetails', { hasText: '核对发票和付款' }).click();
+  assert.match(await page.locator('.metrics').innerText(), /已识别付款\s*¥98\.76/);
+  await page.locator('#paymentReview').getByRole('checkbox', { name: /模拟银行明细/ }).check();
+  await page.getByRole('button', { name: '保存核对结果', exact: true }).click();
+  await page.locator('#materialStatus', { hasText: '核定报销 ¥98.76' }).waitFor();
+  await page.locator('#closeDetail').click();
+  await page.locator('#refreshFolders').click();
+  await page.locator('#folderRefreshStatus', { hasText: '刷新完成' }).waitFor();
+  assert.match(await sourceRow.innerText(), /核定 ¥98\.76/);
+  assert.equal(await page.locator('[data-claim-total]').innerText(), '¥98.76');
+  assert.equal(executions, 0);
+});
+
 test('the worklist filters by reimbursement system and selects smart and daily offline claims for a batch', async (t) => {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   t.after(() => context.close());

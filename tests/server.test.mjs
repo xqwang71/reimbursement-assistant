@@ -1217,6 +1217,46 @@ test('manual payment links validate the evidence and survive rechecking unchange
   assert.equal(rechecked.status, 'blocked');
 });
 
+test('attachment review sends the batch text to the selected model and computes amounts locally', async (t) => {
+  const app = await setup(t, {
+    order: null,
+    paymentNote: '附件中的服务说明\n'.repeat(260) + '人工核对字段：模拟订单的付款记录\n联系邮箱：fixture@example.test',
+    modelSettings: { apiKey: 'fixture-key', model: 'fixture-attachments' },
+    fakeCodex: String.raw`let prompt = '';
+      process.stdin.on('data', (chunk) => prompt += chunk);
+      process.stdin.on('end', () => {
+        const files = JSON.parse(prompt.split('文件清单：').at(-1));
+        const invoice = files.find(({ fields }) => fields.includes('发票金额='));
+        const payment = files.find(({ fields }) => fields.includes('支付金额='));
+        if (process.argv[process.argv.indexOf('--model') + 1] !== 'fixture-attachments' ||
+            !invoice || !payment || !payment.content.includes('\n人工核对字段:模拟订单的付款记录\n') ||
+            !payment.fields.includes('日期=') || prompt.includes('fixture@example.test') || prompt.includes('支付.png')) process.exit(2);
+        const text = JSON.stringify({
+          upload: [invoice.name, payment.name], types: { [invoice.name]: 'invoice', [payment.name]: 'payment' },
+          matches: { [invoice.name]: { payment: [payment.name] } }, totalCny: 1
+        });
+        console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text } }));
+      });`,
+  });
+  const cache = join(app.appDir, '.runtime/cache', encodeURIComponent(app.folder));
+  await Promise.all((await readdir(cache)).filter((name) => name.startsWith('selection-')).map((name) => unlink(join(cache, name))));
+  const initial = await app.plan(undefined, { confirm: false });
+  assert.equal(initial.uploadSource, 'rule');
+  assert.equal(initial.totalCny, null);
+  assert.match(initial.warnings.join(' '), /附件识别的外部模型已关闭/);
+
+  const { body: settings } = await app.request('/api/model-settings');
+  settings.assignments.attachments = 'deepseek';
+  assert.equal((await app.request('/api/model-settings', settings)).status, 200);
+  const checked = await app.plan();
+  assert.equal(checked.uploadSource, 'ai', checked.warnings.join(' '));
+  assert.deepEqual(checked.rows[0].paymentFiles, ['支付.png']);
+  assert.equal(checked.totalCny, 9000);
+  const cached = await app.plan();
+  assert.equal(cached.uploadSource, 'ai-cache');
+  assert.equal(cached.totalCny, checked.totalCny);
+});
+
 test('government procurement remains selected when asset evidence needs reconfirmation', async (t) => {
   const app = await setup(t, { subject: '电脑配件', extra: [{ name: '资产入账凭证.pdf', kind: 'asset', text: '固定资产卡片' }] });
   const initial = await app.plan();
