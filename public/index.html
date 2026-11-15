@@ -258,9 +258,9 @@
         <div class="settings-fields basic-settings-fields">
           <label>票据根目录<input id="sourceRoot" placeholder="粘贴本机年度票据文件夹路径" required autocomplete="off"></label>
           <label>公务卡尾号<input id="paymentCardLast4" type="password" maxlength="4" pattern="[0-9]{4}" inputmode="numeric" autocomplete="off" placeholder="公务卡尾号 4 位"></label>
-          <label>教学常用加签人<input id="teachingSigner" maxlength="80" autocomplete="off"></label>
+          <label>教学备用加签人<input id="teachingSigner" maxlength="80" autocomplete="off"></label>
           <label>教学加签人工号（可选）<input id="teachingSignerCode" maxlength="30" autocomplete="off"></label>
-          <label>科研常用加签人<input id="researchSigner" maxlength="80" autocomplete="off"></label>
+          <label>科研备用加签人<input id="researchSigner" maxlength="80" autocomplete="off"></label>
           <label>科研加签人工号（可选）<input id="researchSignerCode" maxlength="30" autocomplete="off"></label>
           <label>预约校区<select id="bookingCampus"><option value="松江">松江</option><option value="长宁">长宁</option></select></label>
           <label class="checkbox-field"><input id="autoPrint" type="checkbox"> 保存预约 PDF 后用本机默认打印机打印</label>
@@ -319,13 +319,36 @@
       <p id="modelSettingsStatus" class="muted" role="status"></p>
     </div>
   </dialog>
+  <dialog id="projectSignerDialog" class="settings-dialog" aria-labelledby="projectSignerTitle">
+    <header class="modal-header">
+      <h2 id="projectSignerTitle">项目默认加签人</h2>
+      <button id="closeProjectSigner" class="modal-close" type="button" aria-label="关闭项目加签人设置">×</button>
+    </header>
+    <form id="projectSignerForm" class="settings-content">
+      <p id="projectSignerProject"></p>
+      <div class="edit-grid">
+        <label>默认加签人姓名<input id="projectSignerName" maxlength="80" autocomplete="off"></label>
+        <label>加签人工号（可选）<input id="projectSignerCode" maxlength="30" autocomplete="off"></label>
+      </div>
+      <p class="muted">清空姓名和工号再保存，即可移除此项目的默认加签人。</p>
+      <div class="settings-actions">
+        <button id="saveProjectSigner" class="primary" type="submit">保存默认加签人</button>
+        <p id="projectSignerStatus" class="muted" role="status"></p>
+      </div>
+    </form>
+  </dialog>
   <dialog id="didiDialog" class="settings-dialog" aria-labelledby="didiTitle">
     <header class="modal-header">
       <h2 id="didiTitle">新增贸大出行</h2>
       <button id="closeDidi" class="modal-close" type="button" aria-label="关闭贸大出行">×</button>
     </header>
     <form id="didiForm" class="settings-content">
-      <div class="edit-grid"><label>预算上限（元）<input id="didiBudget" name="budget" type="number" min="0.01" max="999999999.99" step="0.01" inputmode="decimal" required></label></div>
+      <div class="edit-grid">
+        <label>预算上限（元）<input id="didiBudget" name="budget" type="number" min="0.01" max="999999999.99" step="0.01" inputmode="decimal" required></label>
+        <label>本笔加签人（留空沿用默认）<input id="didiSignerName" maxlength="80" autocomplete="off"></label>
+        <label>本笔加签人工号（可选）<input id="didiSignerCode" maxlength="30" autocomplete="off"></label>
+      </div>
+      <p id="didiSignerDefault" class="muted"></p>
       <p class="muted">保存后填写报销事由，在右栏匹配经费。</p>
       <div class="settings-actions">
         <button id="saveDidi" class="primary" type="submit">保存预算</button>
@@ -344,7 +367,7 @@
         <label>发放类型<input name="grantType" list="payrollGrantTypes" maxlength="100" required></label>
         <datalist id="payrollGrantTypes"><option value="科研项目"></option><option value="非科研项目"></option></datalist>
         <label>加签人<output id="payrollSigner" aria-live="polite">待确认</output></label>
-        <label>本笔加签人（可选）<input name="signerName" maxlength="80" autocomplete="off"></label>
+        <label>本笔加签人（留空沿用默认）<input name="signerName" maxlength="80" autocomplete="off"></label>
         <label>本笔加签人工号（可选）<input name="signerEmployeeNo" maxlength="30" autocomplete="off"></label>
         <label class="edit-wide">发放内容（报销事由）<textarea name="reason" rows="2" maxlength="100" required></textarea></label>
       </div>

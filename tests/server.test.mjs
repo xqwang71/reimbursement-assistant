@@ -482,9 +482,21 @@ test('payroll intake requires each purpose and uses the grant type to choose the
   assert.equal((await app.request(route)).body.project.projectNo, project.projectNo);
   assert.equal((await app.request(route)).body.signer.name, '示例科研加签人');
   assert.equal((await app.request(route, { ...input, revision: draft.revision }, 'PUT')).status, 409);
+  const projectSigner = { name: '模拟项目加签人', employeeNo: 'TEST-401' };
+  assert.equal((await app.request('/api/project-signer', {
+    sourceRoot: app.sourceRoot, projectNo: project.projectNo, signer: projectSigner,
+  })).status, 200);
+  const inherited = (await app.request(route)).body;
+  assert.deepEqual(inherited.signer, projectSigner);
+  assert.equal(inherited.signerDefaultSource, 'project');
+  const signerOverride = { name: '模拟单笔加签人', employeeNo: 'TEST-402' };
+  assert.equal((await app.request(route, { ...input, revision: inherited.revision, signerOverride }, 'PUT')).status, 200);
+  const edited = (await app.request(route)).body;
+  assert.deepEqual(edited.signer, signerOverride);
+  assert.equal((await app.request(route, { ...input, revision: edited.revision, signerOverride: null }, 'PUT')).status, 200);
   const prepared = await app.request(route + '/prepare', { sourceRoot: app.sourceRoot });
   assert.equal(prepared.status, 202);
-  assert.deepEqual(prepared.body.run.plan.signer, { name: '示例科研加签人', employeeNo: '' });
+  assert.deepEqual(prepared.body.run.plan.signer, projectSigner);
   assert.doesNotMatch(JSON.stringify(prepared.body), /模拟人员|001X|问卷编码/);
 });
 
@@ -510,15 +522,26 @@ test('Didi saves a budget, matches in the worklist and starts an independent sma
   await matchClaimProject(app, key, another);
   assert.match((await worklist(key)).didi.blocker, /事由/);
   assert.equal((await app.request('/api/claim-reason', reason)).body.blocker, '');
-  const beforeEdit = (await worklist(key)).didi.revision;
-  assert.equal((await app.request('/api/didi-claims/' + id, { ...scope, budget: '149.95' }, 'PUT')).status, 200);
-  assert.equal((await run(id, beforeEdit)).status, 409);
+  const projectSigner = { name: '项目默认测试人', employeeNo: 'TEST-501' };
+  assert.equal((await app.request('/api/project-signer', { ...scope, projectNo: another.projectNo, signer: projectSigner })).status, 200);
+  const otherClaim = await app.request('/api/didi-claims', { ...scope, budget: '10.00' });
+  await matchClaimProject(app, otherClaim.body.key, another);
+  const beforeEdit = (await worklist(key)).didi;
+  assert.deepEqual(beforeEdit.signer, projectSigner);
+  const signerOverride = { name: '本笔临时测试人', employeeNo: 'TEST-502' };
+  const path = '/api/didi-claims/' + id;
+  assert.equal((await app.request(path, { ...scope, budget: '149.95', revision: beforeEdit.revision, signerOverride }, 'PUT')).status, 200);
+  assert.equal((await app.request(path, { ...scope, budget: '149.95', revision: beforeEdit.revision, signerOverride: null }, 'PUT')).status, 409);
+  assert.equal((await run(id, beforeEdit.revision)).status, 409);
   await app.stop();
   await app.start();
   const ready = await worklist(key);
   assert.equal(ready.didi.blocker, '');
   assert.equal(ready.didi.budgetCny, 14995);
   assert.equal(ready.match.projectNo, another.projectNo);
+  assert.deepEqual(ready.didi.signerOverride, signerOverride);
+  assert.deepEqual(ready.didi.signerDefault, projectSigner);
+  assert.deepEqual((await worklist(otherClaim.body.key)).didi.signer, projectSigner);
   const started = await run(id, ready.didi.revision);
   assert.equal(started.status, 202, JSON.stringify(started.body));
   const plan = started.body.batch.runs[0].plan;
@@ -528,6 +551,7 @@ test('Didi saves a budget, matches in the worklist and starts an independent sma
   assert.deepEqual(plan.rows, []);
   assert.deepEqual(plan.uploadFiles, []);
   assert.equal(plan.project.projectNo, another.projectNo);
+  assert.deepEqual(plan.signer, signerOverride);
 });
 
 test('a Didi draft can resume after restart and the claim can be removed after the draft is abandoned', async (t) => {
@@ -1133,6 +1157,55 @@ test('a manually entered signer is selectable later and survives a plan recheck 
   await app.start();
   assert.deepEqual((await app.request('/api/folders')).body.signerNames.slice(0, 2), [name, nextName]);
   assert.equal((await app.plan(undefined, { confirm: false })).signer.name, nextName);
+});
+
+test('conflicting project signers require a claim override and clearing it restores the current default', async (t) => {
+  const first = { projectNo: 'TEST-2026-01', projectName: '模拟项目甲' };
+  const second = { projectNo: 'TEST-2026-02', projectName: '模拟项目乙' };
+  const app = await setup(t, { projects: [first, second] });
+  const scope = { sourceRoot: app.sourceRoot };
+  const firstSigner = { name: '项目甲加签测试人', employeeNo: 'TEST-601' };
+  const secondSigner = { name: '项目乙加签测试人', employeeNo: 'TEST-602' };
+  const saveDefault = (projectNo, signer) => app.request('/api/project-signer', { ...scope, projectNo, signer });
+  assert.equal((await saveDefault(' test-2026-01 ', firstSigner)).status, 200);
+  assert.equal((await saveDefault(second.projectNo, secondSigner)).status, 200);
+  await matchClaimProject(app, app.folder, first);
+  assert.deepEqual((await app.plan(undefined, { confirm: false })).signer, firstSigner);
+  await matchClaimProject(app, app.folder, second);
+  assert.deepEqual((await app.plan(undefined, { confirm: false })).signer, secondSigner);
+
+  const match = { funding: '教学', allocations: [{ ...first, amountCny: 4000 }, { ...second, amountCny: null }] };
+  assert.equal((await app.request('/api/project-match', { ...scope, folder: app.folder, match })).status, 200);
+  const conflicted = await app.plan();
+  assert.equal(conflicted.status, 'ready');
+  assert.equal(conflicted.signer, null);
+  assert.equal(conflicted.signerDefaultSource, 'conflict');
+  const blocked = await app.request('/api/batch-runs', { planIds: [conflicted.id] });
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.body.error, /默认加签人不同/);
+  await assert.rejects(access(app.started));
+
+  const signerOverride = { name: '模拟单笔指定人', employeeNo: 'TEST-603' };
+  const saveOverride = (planId, signer) => app.request('/api/plan-override', {
+    ...scope, folder: app.folder, planId, signerOverride: signer,
+  });
+  assert.deepEqual((await saveOverride(conflicted.id, signerOverride)).body.plan.signer, signerOverride);
+  await matchClaimProject(app, app.folder, second);
+  await app.stop();
+  await app.start();
+  assert.deepEqual((await app.request('/api/projects')).body.projectSigners, {
+    [first.projectNo]: firstSigner, [second.projectNo]: secondSigner,
+  });
+  const rechecked = await app.plan(undefined, { confirm: false });
+  assert.deepEqual(rechecked.signerDefault, secondSigner);
+  assert.deepEqual(rechecked.signer, signerOverride);
+  const cleared = await saveOverride(rechecked.id, null);
+  assert.equal(cleared.body.plan.signerOverride, null);
+  assert.deepEqual(cleared.body.plan.signer, secondSigner);
+  assert.equal((await saveDefault(second.projectNo, null)).status, 200);
+  const fallback = await app.plan(undefined, { confirm: false });
+  assert.equal(fallback.signerDefaultSource, 'funding');
+  assert.equal(fallback.signer.name, '示例教学加签人');
 });
 
 test('an explicit project match survives restart before any plan is generated', async (t) => {

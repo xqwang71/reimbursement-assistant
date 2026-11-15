@@ -18,7 +18,8 @@ export function bindPayrollForm({ api, $, money, getContext, onSave }) {
   function renderSigner() {
     const { signerNames } = getContext();
     const type = grantType.value.trim();
-    $('payrollSigner').textContent = form.elements.namedItem('signerName').value.trim() || signerNames[type] || '待确认';
+    const projectSigner = editing?.projectSigner;
+    $('payrollSigner').textContent = form.elements.namedItem('signerName').value.trim() || projectSigner?.name || signerNames[type] || '待确认';
   }
 
   function renderTotal() {
@@ -179,7 +180,9 @@ export function bindPayrollForm({ api, $, money, getContext, onSave }) {
       form.reset();
       people.replaceChildren();
       status.textContent = '';
-      editing = draft ? { id: item.groupId, revision: draft.revision } : null;
+      editing = draft ? { id: item.groupId, revision: draft.revision,
+        projectSigner: draft.signerDefaultSource === 'project' ? draft.signerDefault : null,
+      } : null;
       formRoot = sourceRoot;
       $('payrollTitle').textContent = editing ? '修改薪酬申报' : '新增薪酬申报';
       category.replaceChildren(...categories.map((label) => new Option(label, label)));
