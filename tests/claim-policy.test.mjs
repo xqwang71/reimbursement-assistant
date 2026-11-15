@@ -177,7 +177,7 @@ test('a matching bank consumption debit proves payment without separate posting 
   const selection = { matches: { '发票1.pdf': link(null, '支付1.png') } };
   const check = (text) => assess([invoice(1, 180000), payment(1, 180000, { text })], { selection });
 
-  for (const heading of ['收支详情', '明细详情']) {
+  for (const heading of ['收支详情', '明细详情', '收支详情\nつ', '明细详情\n↓\nソ']) {
     const valid = check(receipt.replace('收支详情', heading));
     assert.deepEqual(valid.blockers, []);
     assert.equal(valid.totalCny, 180000);
@@ -186,6 +186,7 @@ test('a matching bank consumption debit proves payment without separate posting 
 
   for (const text of [
     receipt.replace('-1,800.00\n', ''),
+    receipt.replace('收支详情\n', '收支详情\n其他金额\n'),
     receipt.replace('-1,800.00', '-1,700.00'),
     receipt.replace('交易金额\n1,800.00', '交易金额\n1,700.00'),
     receipt + '\n交易处理中',
