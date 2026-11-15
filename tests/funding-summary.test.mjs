@@ -68,6 +68,25 @@ test('a verified receipt contributes to progress before school exports are avail
   assert.equal(summary.totals.rate, 0.05);
 });
 
+test('a locally withdrawn import is visible and excluded from totals without affecting the replacement claim', () => {
+  const pending = school('DEMO-OLD', { amountCny: 20000, state: 'pending', status: '提交' });
+  const replacement = school('DEMO-NEW', { projectNo: b, amountCny: 20000 });
+  const withdrawals = new Set(['DEMO-OLD']);
+  const summary = report([pending, replacement], { withdrawals });
+  const first = summary.projects.find(({ projectNo }) => projectNo === a);
+  const second = summary.projects.find(({ projectNo }) => projectNo === b);
+  assert.equal(first.progressCny, 0);
+  assert.equal(first.pendingCny, 0);
+  assert.deepEqual(first.records.map(({ state, originalStatus, restorable }) => ({ state, originalStatus, restorable })),
+    [{ state: 'withdrawn', originalStatus: '提交', restorable: true }]);
+  assert.equal(second.bookedCny, 20000);
+  assert.match(fundingSummaryCsv(summary, true), /"本机已登记撤回","否",200\.00/);
+  assert.equal(report([pending, replacement]).totals.submittedCny, 20000);
+  const verified = report([{ ...pending, state: 'booked', status: '已记账' }, replacement], { withdrawals });
+  assert.equal(verified.totals.bookedCny, 40000);
+  assert.match(verified.issues[0].message, /已按学校入账计算/);
+});
+
 test('school payroll export replaces one verified receipt with its actual person rows', () => {
   const local = receipt('LABOR-TEST', { totalCny: 30000, subject: '劳务费', reimbursementRoute: 'labor', payrollRevision: 'v1' });
   const first = school('LABOR-TEST', { kind: 'labor', laborKey: 'person1', projectNo: a, amountCny: 10000 });

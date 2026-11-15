@@ -11,6 +11,7 @@ debug_*
 *.sqlite-*
 .env
 .env.*
+/owner/
 .DS_Store
 Thumbs.db
 __pycache__/
@@ -23,6 +24,12 @@ __pycache__/
 *.jpg
 *.jpeg
 *.webp
+!/examples/2026/2026年度进账与报销台账.xlsx
+!/examples/2027/2027年度进账与报销台账.xlsx
+!/examples/202[67]/报销单统计.xlsx
+!/examples/202[67]/报销单查询.xlsx
+!/examples/202[67]/学生劳务费导出.xlsx
+!/examples/202[67]/校外人员劳务费导出.xlsx
 !/examples/2099/2099年度进账与报销台账.xlsx
 !/examples/2099/报销单统计.xlsx
 !/examples/2099/报销单查询.xls

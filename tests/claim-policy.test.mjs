@@ -36,8 +36,8 @@ test('matching only by amount or folder is not a confirmed invoice-to-payment as
   const result = assess([invoice(1, 10000), order(1, 10000), payment(1, 9000)]);
   assert.equal(result.status, 'blocked');
   assert.equal(result.totalCny, null);
-  assert.match(result.blockers.join(' '), /付款缺少对应发票/);
-  assert.match(result.blockers.join(' '), /发票缺少对应的有效付款凭证/);
+  assert.match(result.blockers.join(' '), /已识别付款 90\.00 元，请确认对应发票/);
+  assert.match(result.blockers.join(' '), /发票尚未关联有效付款凭证/);
 });
 
 test('a single invoice can be paid by several settled payments and large differences are blocked', () => {
@@ -51,6 +51,21 @@ test('a single invoice can be paid by several settled payments and large differe
     assert.equal(mismatch.status, 'blocked');
     assert.match(mismatch.blockers.join(' '), /金额差额过大/);
   }
+});
+
+test('manually linking split payments uses settled evidence and keeps amount checks', () => {
+  const docs = [invoice(1, 12400), payment(1, 5200), payment(2, 7200)];
+  const confirmations = { paymentLinks: { [invoiceNo(1)]: ['支付1.png', '支付2.png'] } };
+  const result = assess(docs, { confirmations });
+  assert.equal(result.status, 'ready');
+  assert.equal(result.totalCny, 12400);
+  assert.deepEqual(result.rows[0].paymentFiles, ['支付1.png', '支付2.png']);
+  assert.equal(result.paymentKeys.filter((key) => key.startsWith('transaction:')).length, 2);
+
+  const reversed = assess([...docs.slice(0, 2), { ...docs[2], text: '已退款' }], { confirmations });
+  assert.equal(reversed.status, 'blocked');
+  assert.equal(reversed.paymentCandidates.length, 1);
+  assert.match(reversed.blockers.join(' '), /金额差额过大/);
 });
 
 test('one settled payment can cover several invoices referenced by their order numbers', () => {
@@ -145,9 +160,11 @@ test('dated posted bank transactions are accepted as settled evidence', () => {
 test('a posted bank consumption detail proves payment without a success label', () => {
   const documents = [invoice(1, 10000), order(1, 10000), payment(1, 10000, { text: bankReceipt })];
   const selection = { matches: { '发票1.pdf': link('订单1.pdf', '支付1.png') } };
-  const result = assess(documents, { selection });
-  assert.equal(result.status, 'ready');
-  assert.equal(result.paidTotalCny, 10000);
+  for (const heading of ['收支详情', '明细详情']) {
+    const result = assess([...documents.slice(0, 2), payment(1, 10000, { text: bankReceipt.replace('收支详情', heading) })], { selection });
+    assert.equal(result.status, 'ready');
+    assert.equal(result.paidTotalCny, 10000);
+  }
   for (const text of [bankReceipt + '\n退款完成', bankReceipt.replace('消费', '预授权'), bankReceipt.replace('记账金额\n100.00', '记账金额\n90.00')]) {
     const unsafe = assess([documents[0], documents[1], payment(1, 10000, { text })], { selection });
     assert.equal(unsafe.status, 'blocked');
@@ -160,10 +177,12 @@ test('a matching bank consumption debit proves payment without separate posting 
   const selection = { matches: { '发票1.pdf': link(null, '支付1.png') } };
   const check = (text) => assess([invoice(1, 180000), payment(1, 180000, { text })], { selection });
 
-  const valid = check(receipt);
-  assert.deepEqual(valid.blockers, []);
-  assert.equal(valid.totalCny, 180000);
-  assert.deepEqual(valid.rows[0].paymentFiles, ['支付1.png']);
+  for (const heading of ['收支详情', '明细详情']) {
+    const valid = check(receipt.replace('收支详情', heading));
+    assert.deepEqual(valid.blockers, []);
+    assert.equal(valid.totalCny, 180000);
+    assert.deepEqual(valid.rows[0].paymentFiles, ['支付1.png']);
+  }
 
   for (const text of [
     receipt.replace('-1,800.00\n', ''),
@@ -192,7 +211,7 @@ test('JD and bank receipts for the same card, amount and second count once', () 
   const unrelated = assess([...documents.slice(0, 3), payment(2, 10000, { text: bankReceipt.replace('10:03:15', '10:04:15') })], { selection });
   assert.equal(unrelated.status, 'blocked');
   assert.equal(unrelated.paidTotalCny, 10000);
-  assert.match(unrelated.blockers.join(' '), /付款缺少对应发票/);
+  assert.match(unrelated.blockers.join(' '), /已识别付款 100\.00 元，请确认对应发票/);
 });
 
 test('per-invoice minimum survives an exactly reconciled combined payment', () => {

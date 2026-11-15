@@ -26,6 +26,7 @@ let browser;
 let server;
 let origin;
 let uiChecks = 0;
+let uiSourceRefresh;
 let uiExecuteRequests = 0;
 let uiPurposePayload;
 let uiPreparedPlan;
@@ -216,7 +217,7 @@ test.before(async () => {
       if (request.url === '/api/config') return json({ sourceRoot: uiSourceRoot, defaultSourceRoot: uiSourceRoot, paymentCardConfigured: true });
       if (request.url === '/api/projects') return json({ projects: uiProjects.map(({ projectNo, projectName }) => ({ projectNo, projectName })), syncedAt: null });
       if (request.url === '/api/projects/sync') return json({ projects: uiProjects, syncedAt: '2026-11-10T01:00:00Z' });
-      if (request.url === '/api/folders') return json({ sourceRoot: uiSourceRoot, signerNames: uiSignerNames, folders: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...[uiFolder, uiSecondFolder].map(path => ({ path, fileCount: 3, reimbursed: false, claimKey: uiGroup?.key, claimLabel: uiGroup?.name }))], claims: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...(uiGroup ? [{ path: uiGroup.key, groupId: uiGroup.id, label: uiGroup.name, sourceFolders: uiGroup.folders, subject: '办公用品', fileCount: 6, reimbursed: false, match: uiMatch, reasonDraft: uiReasonDraft, reasonSaved: uiReasonSaved, offlineBooking: uiGroup.bookingOptions?.offline === true }] : [])] });
+      if (request.url === '/api/folders') return json({ sourceRoot: uiSourceRoot, signerNames: uiSignerNames, folders: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...[uiFolder, uiSecondFolder].map(path => ({ path, fileCount: uiSourceRefresh && path === uiFolder ? 4 : 3, reimbursed: false, claimKey: uiGroup?.key, claimLabel: uiGroup?.name }))], claims: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...(uiGroup ? [{ path: uiGroup.key, groupId: uiGroup.id, label: uiGroup.name, sourceFolders: uiGroup.folders, subject: '办公用品', fileCount: 6, reimbursed: false, match: uiMatch, reasonDraft: uiReasonDraft, reasonSaved: uiReasonSaved, offlineBooking: uiGroup.bookingOptions?.offline === true }] : [])] });
       if (request.url === '/api/claim-groups') {
         const input = await payload(request);
         assert.deepEqual(input.folders.sort(), [uiFolder, uiSecondFolder].sort());
@@ -266,6 +267,10 @@ test.before(async () => {
       if (request.url === '/api/login-status') return json({ loggedIn: true, message: '本地模拟页面' });
       if (request.url === '/api/plans') {
         const input = await payload(request);
+        if (uiSourceRefresh && input.folder === uiFolder) {
+          await uiSourceRefresh;
+          return json({ plan: { ...uiPlan(), folder: input.folder, totalCny: 3850, invoiceTotalCny: 5000, fingerprint: 'fixture-updated', cacheState: 'new' } });
+        }
         if ([uiFolder, uiSecondFolder].includes(input.folder)) return json({ plan: { ...uiPlan(), folder: input.folder, totalCny: 4938, invoiceTotalCny: 5000 } });
         uiChecks += 1;
         assert.equal(input.folder, uiGroupKey);
@@ -938,6 +943,101 @@ test('the foreign claim detail updates its total after saving the selected quote
   await download.waitFor();
   assert.equal(await download.getAttribute('href'), `/api/plans/${uiPlan().id}/fx-quote/${key}`);
   assert.match(await page.locator('.metrics').innerText(), /核定报销\s*¥96\.16/);
+});
+
+test('a recognized payment can be linked before funding allocation and stays visible after refresh', async (t) => {
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  const match = { funding: '教学', allocations: projectFixture.map((project) => ({ ...project, amountCny: null })) };
+  const claim = { path: uiGroupKey, groupId: uiPlan().groupId, label: uiFolder, sourceFolders: [uiFolder], subject: '办公用品', fileCount: 2, match };
+  const source = { path: uiFolder, fileCount: 2, claimKey: uiGroupKey, claimLabel: claim.label };
+  const evidence = { name: '模拟银行明细.png', amountCny: 9876, date: '2026-07-08' };
+  let saved = false;
+  let executions = 0;
+  const planFor = (folder) => {
+    const linked = saved && folder === uiGroupKey;
+    return {
+      ...uiPlan(), folder, sourceFolders: folder === uiGroupKey ? [uiFolder] : undefined,
+      project: projectFixture[0], reimbursementRoute: 'smart', status: 'blocked', reason,
+      blockers: [linked ? '请填写每个手动分配项目的金额' : '已识别付款 98.76 元，请确认对应发票'],
+      rows: [{ invoiceNumber: number, invoiceAmountCny: 10000, invoiceFile: '发票.pdf',
+        paymentFiles: linked ? [evidence.name] : [], paidAmountCny: linked ? 9876 : null }],
+      paymentCandidates: [evidence], totalCny: linked ? 9876 : null, paidTotalCny: linked ? 9876 : null,
+    };
+  };
+  await context.route('**/*', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.origin !== origin) return route.abort();
+    if (url.pathname === '/api/folders') return route.fulfill({ json: { sourceRoot: uiSourceRoot, folders: [source], claims: [claim] } });
+    if (url.pathname === '/api/plans') {
+      const { folder } = route.request().postDataJSON();
+      return route.fulfill({ json: { plan: planFor(folder), match } });
+    }
+    if (url.pathname === `/api/plans/${uiPlan().id}/confirmations`) {
+      assert.deepEqual(route.request().postDataJSON().paymentLinks, { [number]: [evidence.name] });
+      saved = true;
+      return route.fulfill({ json: { plan: planFor(uiGroupKey) } });
+    }
+    if (url.pathname === '/api/batch-runs' && route.request().method() === 'POST') {
+      executions += 1;
+      return route.fulfill({ status: 409, json: { error: '材料待核对' } });
+    }
+    return route.continue();
+  });
+  const page = await context.newPage();
+  await page.goto(`${origin}/runner`);
+  const sourceRow = page.locator('.source-row', { hasText: uiFolder });
+  await sourceRow.getByText(/识别到付款 ¥98\.76 · 待确认对应关系/).waitFor();
+  await page.locator('.allocation-status', { hasText: '请先核对发票和付款并保存' }).waitFor();
+  await page.locator('.row-select').check();
+  await page.locator('#executeSelected').click();
+  assert.match(await page.locator('#executionStatus').innerText(), /已识别付款 98\.76 元/);
+  await page.locator('#executionDetails', { hasText: '核对发票和付款' }).click();
+  assert.match(await page.locator('.metrics').innerText(), /已识别付款\s*¥98\.76/);
+  await page.locator('#paymentReview').getByRole('checkbox', { name: /模拟银行明细/ }).check();
+  await page.getByRole('button', { name: '保存核对结果', exact: true }).click();
+  await page.locator('#materialStatus', { hasText: '核定报销 ¥98.76' }).waitFor();
+  await page.locator('#closeDetail').click();
+  await page.locator('#refreshFolders').click();
+  await page.locator('#folderRefreshStatus', { hasText: '刷新完成' }).waitFor();
+  assert.match(await sourceRow.innerText(), /核定 ¥98\.76/);
+  assert.equal(await page.locator('[data-claim-total]').innerText(), '¥98.76');
+  assert.equal(executions, 0);
+});
+
+test('registering a manual school receipt clears a stale batch failure label', async (t) => {
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  const createdAt = '2026-07-08T02:00:00Z';
+  const plan = { ...uiPlan(), reimbursementRoute: 'smart' };
+  const run = { id: 'test-receipt-run', plan, status: 'error', error: '支付未完成', canEndDraft: true,
+    createdAt, updatedAt: createdAt, events: [], messages: [] };
+  let payload;
+  await context.route('**/*', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.origin !== origin) return route.abort();
+    if (url.pathname === '/api/folders') return route.fulfill({ json: { sourceRoot: uiSourceRoot, folders: [], claims: [] } });
+    if (url.pathname === '/api/runs') return route.fulfill({ json: { runs: [run], blockingRunId: run.canEndDraft ? run.id : null } });
+    if (url.pathname === '/api/batches') return route.fulfill({ json: {
+      batches: [{ id: 'test-manual-batch', status: 'error', currentIndex: 0, currentRunId: run.id, createdAt, runs: [run] }],
+    } });
+    if (url.pathname === `/api/runs/${run.id}/resolution`) {
+      payload = route.request().postDataJSON();
+      Object.assign(run, { status: 'completed', canEndDraft: false, error: null });
+      return route.fulfill({ json: { run } });
+    }
+    assert.ok(!url.pathname.endsWith('/instructions'));
+    return route.continue();
+  });
+  const page = await context.newPage();
+  await page.goto(`${origin}/runner`);
+  await page.locator('#viewBlockingRun').click();
+  await page.locator('#runStatus', { hasText: '批次失败' }).waitFor();
+  page.once('dialog', (dialog) => dialog.accept('TEST-RECEIPT-001'));
+  await page.getByRole('button', { name: '登记手动提交', exact: true }).click();
+  await page.locator('#runStatus', { hasText: '批次已完成' }).waitFor();
+  assert.deepEqual(payload, { confirmed: true, resolution: 'submitted', financeFormId: 'TEST-RECEIPT-001' });
+  await page.locator('#blockingRunNotice').waitFor({ state: 'hidden' });
 });
 
 test('the worklist filters by reimbursement system and selects smart and daily offline claims for a batch', async (t) => {
@@ -1728,6 +1828,56 @@ test('a grouped school detail uses the verified original upload and binds its dr
   await assert.rejects(instance.assertDocumentIdentity(), /草稿已变化/);
 });
 
+test('a school-truncated grouped purpose is shown for approval and rechecked before submission', async (t) => {
+  const { instance, frame, page, plan } = await setup(t, 'detail');
+  plan.reason = '模拟实验课程演示软件许可费';
+  const actualPurpose = '模拟实验课程演示软件';
+  const files = ['模拟票据甲.pdf', '模拟票据乙.pdf', '模拟支付.png'];
+  plan.uploadFiles = files.map((name) => ({ name }));
+  const { invoiceNumber } = plan.rows[0];
+  plan.rows = [6100, 3700].map((amountCny, index) => ({
+    invoiceNumber: invoiceNumber.slice(0, -1) + (index + 1), invoiceFile: files[index],
+    invoiceAmountCny: amountCny, paidAmountCny: amountCny, reimbursementAmountCny: amountCny,
+  }));
+  plan.totalCny = plan.invoiceTotalCny = plan.paidTotalCny = 9800;
+  instance.control.autoSubmit = true;
+  instance.progress = instance.control.progress = {
+    ownedDocument: true, uploadPageId: await browserTargetId(page), uploads: [{
+      state: 'verified', files, proof: { schoolReceipt: { invoiceCount: 2, attachmentCount: 1, invoiceTotalCny: 9800 } },
+    }], submission: { state: 'not_started' }, paymentVerified: true,
+  };
+  await frame.evaluate(({ projectNo, signer, actualPurpose }) => {
+    history.replaceState(null, '', '/ClaimsPublicPCWeb/filling?id=fixture-purpose-limit');
+    document.querySelector('#app').innerHTML = `<p>${projectNo} ${signer.name} ${signer.employeeNo}</p>
+      <section><h2>报销支出费用明细</h2><div class="el-collapse-item"><div class="detail">
+        <input placeholder="请输入金额" value="98.00"><input placeholder="请输入用途" maxlength="${actualPurpose.length}">
+      </div></div><p>待分配金额：￥0.00</p></section>
+      <div class="el-dialog"><h2>确认提交报销单</h2><p>报销金额：98.00</p><button>提交预审</button></div>`;
+    document.querySelector('button').onclick = () => { window.confirmClicks = (window.confirmClicks || 0) + 1; };
+    document.querySelector('[placeholder="请输入用途"]').value = actualPurpose;
+  }, { projectNo: plan.project.projectNo, signer: plan.signer, actualPurpose });
+  const purpose = frame.getByPlaceholder('请输入用途');
+  await purpose.evaluate((field) => field.removeAttribute('maxlength'));
+  await assert.rejects(instance.verifyDetailAmounts(), /用途核验失败/);
+  await purpose.evaluate((field, limit) => { field.maxLength = limit; }, actualPurpose.length);
+  await instance.verifyDetailAmounts();
+  assert.equal(instance.progress.schoolDetailPurpose, actualPurpose);
+  assert.equal(instance.progress.detailVerified, true);
+  instance.ask = async (question, metadata) => {
+    assert.equal(metadata.kind, 'final_approval');
+    assert.ok(question.includes(plan.reason));
+    assert.ok(question.includes(`实际显示「${actualPurpose}」`));
+    return '先别提交';
+  };
+  assert.equal(await instance.confirmAndFinish(), 'preview');
+  instance.ask = async () => {
+    await purpose.fill('修改后的其他用途');
+    return '确认提交';
+  };
+  await assert.rejects(instance.confirmAndFinish(), /用途核验失败/);
+  assert.equal(await frame.evaluate(() => window.confirmClicks || 0), 0);
+});
+
 test('the school receipt verifies this upload without displaying the original filenames', async (t) => {
   const { instance, frame, plan } = await setup(t, 'start');
   const directory = await mkdtemp(join(tmpdir(), 'runner-upload-fixture-'));
@@ -1829,7 +1979,51 @@ test('automatic submission records the signer click first and settles on the mat
   assert.equal(await instance.schoolSubmissionReceipt(), null);
 });
 
-test('the late confirmation after school pre-review is accepted once and verified by its receipt', async (t) => {
+test('a split payment uses the school fill action and waits until the school advances', async (t) => {
+  const { instance, frame, plan } = await setup(t, 'detail');
+  Object.assign(plan, {
+    totalCny: 10000, paidTotalCny: 10000,
+    projectAllocationDraft: projectFixture.map((project, index) => ({ ...project, amountCny: index === 0 ? 6000 : null })),
+  });
+  instance.paymentAdvanceTimeoutMs = 1600;
+  await frame.evaluate((type) => {
+    const app = document.querySelector('#app');
+    app.innerHTML = `<section class="part-box"><h2>支付信息</h2><button>添加支付类型</button><p>${type}</p>
+      <input placeholder="请输入金额"><button id="fill-all">全部填入</button><p id="remaining">待支付金额：￥100.00</p>
+      <button id="save-payment">保存并下一步</button></section>`;
+    const amount = app.querySelector('input');
+    const left = app.querySelector('#remaining');
+    window.schoolFillCount = 0;
+    window.paymentSaveCount = 0;
+    window.schoolCanSavePayment = false;
+    let schoolAmount = '0.00';
+    const renderAmount = () => { left.textContent = `待支付金额：￥${(100 - Number(amount.value)).toFixed(2)}`; };
+    amount.oninput = renderAmount;
+    app.querySelector('#fill-all').onclick = () => {
+      window.schoolFillCount += 1;
+      schoolAmount = '100.00';
+      amount.value = schoolAmount;
+      renderAmount();
+    };
+    app.querySelector('#save-payment').onclick = () => {
+      window.paymentSaveCount += 1;
+      if (!window.schoolCanSavePayment || schoolAmount !== '100.00') {
+        amount.value = '';
+        renderAmount();
+        return;
+      }
+      app.insertAdjacentHTML('beforeend', '<div class="el-dialog"><h2>确认提交报销单</h2><button>提交预审</button></div>');
+    };
+  }, plan.paymentType);
+  await assert.rejects(instance.fillPayment(), /学校仍显示待支付 100\.00 元/);
+  assert.equal(instance.progress.paymentVerified, false);
+  await frame.evaluate(() => { window.schoolCanSavePayment = true; });
+  assert.equal(await instance.fillPayment(), 'confirm');
+  assert.equal(instance.progress.paymentVerified, true);
+  assert.deepEqual(await frame.evaluate(() => [window.schoolFillCount, window.paymentSaveCount]), [2, 2]);
+});
+
+test('the late confirmation on the school pre-review page is accepted once and verified by its receipt', async (t) => {
   const { instance, page, frame, plan } = await setup(t, 'signer');
   instance.progress.uploadPageId = await browserTargetId(page);
   instance.progress.fillingId = 'fixture-draft-002';
@@ -1843,6 +2037,7 @@ test('the late confirmation after school pre-review is accepted once and verifie
       event.stopPropagation();
       window.signerClicks = (window.signerClicks || 0) + 1;
       setTimeout(() => {
+        history.replaceState(null, '', '/ClaimsPublicPCWeb/preliminaryExamination?code=FIXTURE-0010');
         const app = document.getElementById('app');
         app.innerHTML = `<p>报销单号：DOC-000001</p><p>${projectNo} 示例教学加签人 980001</p><p>报销金额：90.00</p>
           <input placeholder="请输入用途"><div class="el-dialog"><h2>确认提交报销单</h2><button>提交预审</button></div>`;
@@ -1872,6 +2067,7 @@ test('the late confirmation after school pre-review is accepted once and verifie
   };
   assert.equal(await instance.confirmAndFinish(await instance.addSigner()), 'submitted');
   assert.equal(instance.progress.submission.financeFormId, 'FIXTURE-0010');
+  assert.equal(instance.progress.preReviewFinanceFormId, 'FIXTURE-0010');
   assert.equal(instance.progress.submission.action, 'confirm_pre_review');
   assert.deepEqual(await frame.evaluate(() => [window.signerClicks, window.finalSubmitClicks, window.followupClicks]), [1, 1, 1]);
 });
@@ -2060,6 +2256,24 @@ test('the worklist groups source folders before saving purpose, matching funding
   await page.locator('#refreshFolders').click();
   await rechecked;
   assert.ok(uiChecks > checksBeforeRefresh);
+  await page.locator('#folderRefreshStatus').filter({ hasText: '刷新完成' }).waitFor();
+  const sourceRow = page.locator('.source-row').filter({ has: page.getByRole('checkbox', { name: `选择来源 ${uiFolder}`, exact: true }) });
+  assert.equal(await page.locator('#receiptDirectory').textContent(), uiSourceRoot);
+  assert.match(await sourceRow.innerText(), /49\.38/);
+  const refresh = Promise.withResolvers();
+  uiSourceRefresh = refresh.promise;
+  try {
+    await page.locator('#refreshFolders').click();
+    await sourceRow.getByText(/4 个文件/).waitFor();
+    assert.equal(await page.locator('#refreshFolders').isDisabled(), true);
+    assert.match(await page.locator('#folderRefreshStatus').innerText(), /正在核对/);
+    refresh.resolve();
+    await sourceRow.getByText(/38\.50/).waitFor();
+    await page.locator('#folderRefreshStatus').filter({ hasText: '1 个有新材料或文件变化' }).waitFor();
+  } finally {
+    refresh.resolve();
+    uiSourceRefresh = null;
+  }
   const alignment = await page.evaluate(() => {
     const panes = [...document.querySelectorAll('.match-pane')];
     return panes.map((pane) => {

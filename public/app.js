@@ -14,10 +14,16 @@ const TRAVEL_ROLES = [
   { value: 'ministerial_academician', label: '部级及相当职务人员、院士' },
 ];
 const ACTIVE_RUN_STATUSES = new Set(['queued', 'running', 'waiting_input', 'pausing']);
-const CONFIG_STORAGE_KEY = 'reimbursement-assistant-row-configs';
-const storedConfigs = (() => {
-  try { return JSON.parse(localStorage.getItem(CONFIG_STORAGE_KEY) || '{}') || {}; } catch { return {}; }
-})();
+const LEGACY_CONFIG_STORAGE_KEY = 'reimbursement-assistant-row-configs';
+let configStorageKey;
+let storedConfigs = {};
+function selectConfigStorage(workspace) {
+  const scope = workspace ? `:${encodeURIComponent(workspace.owner)}:${workspace.year}` : '';
+  const key = LEGACY_CONFIG_STORAGE_KEY + scope;
+  if (key === configStorageKey) return;
+  configStorageKey = key;
+  try { storedConfigs = JSON.parse(localStorage.getItem(key) || '{}') || {}; } catch { storedConfigs = {}; }
+}
 const state = {
   folders: [],
   sourceFolders: [],
@@ -26,6 +32,8 @@ const state = {
   sourceAmounts: new Map(),
   sourceRoot: '',
   demoMode: true,
+  workspace: null,
+  blockingRun: null,
   defaultSourceRoot: '',
   projects: [],
   payrollCategories: [],
@@ -43,7 +51,7 @@ const state = {
   detailFolder: '',
   batch: null,
   run: null,
-  autoChecking: false,
+  autoChecking: null,
   executing: false,
   sending: false,
   configurationGeneration: 0,
@@ -64,14 +72,42 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => 
 const itemFor = (folder) => state.folders.find((item) => item.path === folder);
 const displayNameFor = (folder) => itemFor(folder)?.label || folder;
 
+function recognizedPaymentTotal(plan) {
+  return plan?.paymentCandidates?.length
+    ? plan.paymentCandidates.reduce((total, { amountCny }) => total + amountCny, 0)
+    : null;
+}
+
+function paymentReviewNeeded(plan) {
+  if (!plan?.paymentCandidates?.length || !plan.rows.length) return false;
+  const linked = new Set(plan.rows.flatMap((row) => row.paymentFiles || []));
+  return plan.rows.some((row) => !row.paymentFiles?.length) || plan.paymentCandidates.some(({ name }) => !linked.has(name));
+}
+
 function renderSources() {
   const pending = state.sourceFolders.filter((item) => !item.reimbursed);
   const keyword = $('sourceFilter').value.trim().toLowerCase();
   $('sourceCount').textContent = `${pending.filter((item) => !item.claimKey).length} 个可合并`;
   $('sourceRows').innerHTML = pending.filter((item) => item.path.toLowerCase().includes(keyword)).map((item) => {
-    const amount = state.sourceAmounts.get(item.path);
-    const value = Number.isSafeInteger(amount?.totalCny) ? `核定 ${money(amount.totalCny)}` : Number.isSafeInteger(amount?.invoiceTotalCny) ? `发票 ${money(amount.invoiceTotalCny)}` : '金额待合并核对';
-    return `<label class="source-row${item.claimKey ? ' is-assigned' : ''}"><input type="checkbox" data-source="${escapeHtml(item.path)}" aria-label="选择来源 ${escapeHtml(item.path)}" ${state.selectedSources.has(item.path) ? 'checked' : ''} ${item.claimKey ? 'disabled' : ''}><strong>${escapeHtml(item.path)}</strong><small>${item.fileCount} 个文件 · ${value}</small>${item.claimKey ? `<small>已加入 ${escapeHtml(item.claimLabel)}</small>` : ''}</label>`;
+    const preview = state.sourceAmounts.get(item.path);
+    const claim = state.plans.get(item.claimKey);
+    const merged = claim?.sourceFolders?.length > 1;
+    const amount = claim && !merged ? claim : preview;
+    const recognized = amount?.recognizedPaymentCny ?? recognizedPaymentTotal(amount);
+    let value = '金额待核对';
+    if (merged) {
+      value = Number.isSafeInteger(preview?.totalCny) ? `来源预估 ${money(preview.totalCny)} · 见合并事项` : '见合并事项核对结果';
+    } else if (amount?.error) {
+      value = `识别失败 · ${amount.error}`;
+    } else if (Number.isSafeInteger(amount?.totalCny) && !paymentReviewNeeded(claim)) {
+      value = `核定 ${money(amount.totalCny)}`;
+    } else if (amount) {
+      const invoices = amount.invoiceTotalCny > 0 ? `发票 ${money(amount.invoiceTotalCny)}` : '未识别到有效发票';
+      const payment = recognized > 0 ? `识别到付款 ${money(recognized)}` : '实付待核对';
+      value = `${invoices} · ${payment}`;
+      if (amount.invoiceTotalCny > 0 && recognized > 0 && (!claim || paymentReviewNeeded(claim))) value += ' · 待确认对应关系';
+    }
+    return `<label class="source-row${item.claimKey ? ' is-assigned' : ''}"><input type="checkbox" data-source="${escapeHtml(item.path)}" aria-label="选择来源 ${escapeHtml(item.path)}" ${state.selectedSources.has(item.path) ? 'checked' : ''} ${item.claimKey ? 'disabled' : ''}><strong>${escapeHtml(item.path)}</strong><small>${item.fileCount} 个文件 · ${escapeHtml(value)}</small>${item.claimKey ? `<small>已加入 ${escapeHtml(item.claimLabel)}</small>` : ''}</label>`;
   }).join('') || '<p class="muted">没有符合条件的来源文件夹。</p>';
   const selection = state.selectedSources.size ? `已勾选 ${state.selectedSources.size} 个来源文件夹` : '';
   $('sourceSelection').textContent = [state.sourceNotice, selection].filter(Boolean).join(' ') || '先勾选属于同一事项的文件夹。';
@@ -205,20 +241,35 @@ async function dissolveClaim(folder) {
 }
 
 async function prepareSource(item, generation) {
-  if (item.claimKey && configFor(item.claimKey).subject === '劳务费') return;
   const config = configFor(item.path);
   try {
-    const { plan } = await api('/api/plans', { method: 'POST', body: JSON.stringify({ folder: item.path, subject: config.subject, funding: config.funding, project: null }) });
+    const { plan } = await api('/api/plans', { method: 'POST', body: JSON.stringify({ sourceRoot: state.sourceRoot, folder: item.path, subject: config.subject, funding: config.funding, project: null, previewOnly: true }) });
     if (generation !== state.configurationGeneration) return;
-    state.sourceAmounts.set(item.path, { totalCny: plan.totalCny, invoiceTotalCny: plan.invoiceTotalCny });
+    state.sourceAmounts.set(item.path, {
+      totalCny: plan.totalCny, invoiceTotalCny: plan.invoiceTotalCny, recognizedPaymentCny: recognizedPaymentTotal(plan),
+      fingerprint: plan.fingerprint, cacheState: plan.cacheState,
+    });
     renderSources();
-  } catch {}
+  } catch (error) {
+    if (generation !== state.configurationGeneration) return;
+    state.sourceAmounts.set(item.path, { error: error.message });
+    renderSources();
+  }
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, { headers: { 'content-type': 'application/json' }, ...options });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || `请求失败（${response.status}）`);
+  const requestHeaders = new Headers(options.headers);
+  requestHeaders.set('content-type', 'application/json');
+  if (state.workspace) requestHeaders.set('x-reimbursement-year', state.workspace.year);
+  let response;
+  try {
+    response = await fetch(path, { ...options, headers: requestHeaders });
+  } catch (error) {
+    if (error.name === 'TimeoutError') throw new Error('本机请求超时，请查看当前状态后重试。');
+    throw new Error('无法连接本机服务。请通过「打开报销助手」启动后重试。');
+  }
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || !payload) throw new Error(payload?.error || `本机服务返回异常（${response.status}）。`);
   return payload;
 }
 
@@ -233,7 +284,8 @@ function persistConfigs() {
       travelFundType: config.travelFundType,
     };
   }
-  try { localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(output)); } catch {}
+  storedConfigs = output;
+  try { localStorage.setItem(configStorageKey, JSON.stringify(output)); } catch {}
 }
 
 function configFor(folder) {
@@ -291,6 +343,7 @@ function setRunDrawer(open) {
 
 function rowStatusFor(folder) {
   const item = itemFor(folder);
+  if (state.blockingRun?.plan.folder === folder) return { type: 'reminder', text: runStatusLabel(state.blockingRun) };
   if (item?.didi) {
     const entry = reasonEntry(folder);
     const needsReason = cleanReason(entry.text) !== entry.confirmed || item.didi.blocker;
@@ -393,10 +446,16 @@ function updateRowInPlace(folder) {
     checkbox.disabled = !selectable;
     checkbox.checked = state.selected.has(folder);
     checkbox.title = selectable ? '勾选以加入报销批次' : '请按此事项的办理系统处理';
-    row.querySelector('.folder-route').textContent = ROUTE_LABELS[reimbursementRouteFor(folder)] || '';
-    updateReasonInPlace(folder, row);
+    const route = row.querySelector('.folder-route');
+    if (route) route.textContent = ROUTE_LABELS[reimbursementRouteFor(folder)] || '';
+    if (row.querySelector('.reason-action')) updateReasonInPlace(folder, row);
     updateAllocationInPlace(folder, row);
-    row.querySelector('.detail-row').disabled = !state.plans.has(folder);
+    const details = row.querySelector('.detail-row');
+    if (details) {
+      const plan = state.plans.get(folder);
+      details.disabled = !plan;
+      details.textContent = paymentReviewNeeded(plan) ? '核对发票和付款' : '详情';
+    }
     const amount = folderAmount(folder);
     row.querySelector('.folder-amount').textContent = amount.value;
     row.querySelector('.folder-amount-label').textContent = amount.label;
@@ -452,7 +511,17 @@ function renderMaterialReview(plan) {
     const value = confirmed.paidAmountsCny?.[row.invoiceNumber];
     return `<label>发票 ${escapeHtml(row.invoiceNumber)} 的实付金额（元）<input type="number" min="0.01" step="0.01" inputmode="decimal" data-paid-invoice="${escapeHtml(row.invoiceNumber)}" value="${Number.isSafeInteger(value) ? (value / 100).toFixed(2) : ''}"></label>`;
   }).join('');
+  const payments = plan.paymentCandidates || [];
+  const paymentFields = payments.length && plan.rows.length ? `<details id="paymentReview" class="funding-data" ${paymentReviewNeeded(plan) ? 'open' : ''}>
+    <summary>核对发票对应的付款凭证</summary>
+    <p class="muted">按发票勾选实际对应的付款，可选多笔。核对金额、日期和交易明细后点「保存核对结果」，助手会按发票与对应实付金额的较小值计算。</p>
+    ${plan.rows.map((row) => `<fieldset data-invoice-payments="${escapeHtml(row.invoiceNumber)}">
+      <legend>${escapeHtml(plan.fileSources?.[row.invoiceFile]?.folder || row.invoiceFile)} · 发票 ${escapeHtml(row.invoiceNumber)} · ${money(row.invoiceAmountCny)}${row.date ? ' · ' + escapeHtml(row.date) : ''}</legend>
+      ${payments.map(({ name, amountCny, date }) => `<label class="checkbox-row"><input type="checkbox" value="${escapeHtml(name)}" ${row.paymentFiles.includes(name) ? 'checked' : ''}>${escapeHtml(plan.fileSources?.[name]?.name || name)} · ${money(amountCny)}${date ? ' · ' + escapeHtml(date) : ''}${plan.fileSources?.[name] ? ' · ' + escapeHtml(plan.fileSources[name].folder) : ''}</label>`).join('')}
+    </fieldset>`).join('')}
+  </details>` : '';
   return `<section class="detail-section"><h3>材料核对${paidFields ? '与合并付款分配' : ''}</h3><p class="muted">签字、印章和公务卡核对只作提醒。材料确认和分配金额只用于当前附件。</p>
+    ${paymentFields}
     <div class="edit-grid">
     ${paidFields}
     ${purchase ? `<label>我已核对签字的签收单<select id="confirmReceipt">${options(confirmed.receiptFile)}</select></label>` : ''}
@@ -463,28 +532,51 @@ function renderMaterialReview(plan) {
 }
 
 async function saveMaterialReview() {
-  const plan = state.plans.get(state.detailFolder);
+  const folder = state.detailFolder;
+  const plan = state.plans.get(folder);
   if (!plan) return;
+  const generation = state.configurationGeneration;
+  const status = $('materialStatus');
+  const button = $('saveMaterials');
   const paidAmountsCny = {};
   for (const input of $('detailContent').querySelectorAll('[data-paid-invoice]')) {
     if (!input.value && !input.validity.badInput) continue;
     const amount = Math.round(Number(input.value) * 100);
     if (!input.validity.valid || !Number.isSafeInteger(amount) || amount <= 0) {
-      $('materialStatus').textContent = '请输入大于零的实付金额，最多两位小数。';
+      status.textContent = '请输入大于零的实付金额，最多两位小数。';
       input.focus();
       return;
     }
     paidAmountsCny[input.dataset.paidInvoice] = amount;
   }
-  const payload = { fingerprint: plan.fingerprint, receiptFile: $('confirmReceipt')?.value, assetFile: $('confirmAsset')?.value, sealedDetailFile: $('confirmSeal')?.value, paymentCardConfirmed: $('confirmCard').checked, governmentProcurement: $('confirmGovernmentProcurement')?.checked === true, paidAmountsCny };
-  $('saveMaterials').disabled = true;
+  const paymentLinks = { ...plan.confirmations?.paymentLinks };
+  for (const field of $('detailContent').querySelectorAll('[data-invoice-payments]')) {
+    const invoice = field.dataset.invoicePayments;
+    const inputs = [...field.querySelectorAll('input[type="checkbox"]')];
+    if (inputs.some((input) => input.checked !== input.defaultChecked)) {
+      paymentLinks[invoice] = inputs.filter(({ checked }) => checked).map(({ value }) => value);
+    }
+  }
+  const payload = { fingerprint: plan.fingerprint, receiptFile: $('confirmReceipt')?.value, assetFile: $('confirmAsset')?.value, sealedDetailFile: $('confirmSeal')?.value, paymentCardConfirmed: $('confirmCard').checked, governmentProcurement: $('confirmGovernmentProcurement')?.checked === true, paidAmountsCny,
+    ...(Object.keys(paymentLinks).length ? { paymentLinks } : {}) };
+  button.disabled = true;
+  status.textContent = '正在保存核对结果…';
   try {
-    const result = await api(`/api/plans/${plan.id}/confirmations`, { method: 'POST', body: JSON.stringify(payload) });
-    storeCheckedPlan(result.plan);
+    const { plan: saved } = await api(`/api/plans/${plan.id}/confirmations`, { method: 'POST', body: JSON.stringify(payload) });
+    if (generation !== state.configurationGeneration) return;
+    storeCheckedPlan(saved);
     renderRows();
-    renderDetailModal();
-  } catch (error) { $('materialStatus').textContent = error.message; }
-  finally { if ($('saveMaterials')) $('saveMaterials').disabled = false; }
+    const message = paymentReviewNeeded(saved) ? '核对结果已保存。请继续核对尚未关联的发票或付款。'
+      : Number.isSafeInteger(saved.totalCny) ? `核对结果已保存，核定报销 ${money(saved.totalCny)}。` : '核对结果已保存。请查看剩余金额核对事项。';
+    if ($('executionDetails').dataset.folder === folder) $('executionFeedback').hidden = true;
+    setWorklistStatus(message);
+    if (state.detailFolder === folder) {
+      renderDetailModal();
+      $('materialStatus').textContent = message;
+      $('materialStatus').scrollIntoView({ block: 'nearest' });
+    }
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
 }
 
 function reasonEntry(folder) {
@@ -635,6 +727,9 @@ async function lookupForeignQuote(button) {
 }
 
 function renderPlanDetails(plan) {
+  const recognized = recognizedPaymentTotal(plan);
+  const showRecognized = recognized !== null && (paymentReviewNeeded(plan) || !Number.isSafeInteger(plan.paidTotalCny));
+  const reviewSource = plan.uploadSource === 'ai' ? '模型复核' : plan.uploadSource === 'ai-cache' ? '模型复核结果已缓存' : '本机规则';
   const currentReason = plan.reason && cleanReason(reasonEntry(plan.folder).text) === plan.reason ? plan.reason : '';
   const ready = plan.status === 'ready' && currentReason;
   const labor = plan.subject === '劳务费';
@@ -661,7 +756,7 @@ function renderPlanDetails(plan) {
   const signerOptions = signerNames.map((name) => `<option value="${escapeHtml(name)}" ${plan.signer?.name === name ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('');
   return `<div class="plan">
     <section class="detail-section"><h3>办理系统</h3><p>${routeLabel}</p></section>
-    ${labor ? '' : `<div class="metrics"><div class="metric"><small>发票总额</small><strong>${money(plan.invoiceTotalCny)}</strong></div><div class="metric"><small>实付总额</small><strong>${money(plan.paidTotalCny)}</strong></div><div class="metric"><small>核定报销</small><strong>${money(plan.totalCny)}</strong></div></div>`}
+    ${labor ? '' : `<div class="metrics"><div class="metric"><small>发票总额</small><strong>${money(plan.invoiceTotalCny)}</strong></div><div class="metric"><small>${showRecognized ? '已识别付款' : '已关联实付'}</small><strong>${money(showRecognized ? recognized : plan.paidTotalCny)}</strong></div><div class="metric"><small>核定报销</small><strong>${money(plan.totalCny)}</strong></div></div>`}
     <section class="detail-section"><h3>报销事由</h3><p class="muted">${currentReason ? `${offline ? '' : '学校页面填写内容 '}${escapeHtml(currentReason)}` : '请在报销事项中填写事由，再点击保存或更新。'}</p></section>
     ${plan.sourceFolders ? `<section class="detail-section"><h3>来源文件夹</h3><ul>${plan.sourceFolders.map((folder) => `<li>${escapeHtml(folder)}</li>`).join('')}</ul><p class="muted">合并检查 ${plan.sourceFolders.length} 个文件夹，共用一笔报销事由和经费项目。</p></section>` : ''}
     <div class="edit-grid">
@@ -676,7 +771,7 @@ function renderPlanDetails(plan) {
         <label>本笔加签人工号（可选）<input id="editSignerCode" type="text" maxlength="30" autocomplete="off" value="${escapeHtml(plan.signer?.employeeNo || '')}"></label>`}
     </div>
     <div class="edit-actions"><button id="savePlanEdit" class="secondary" type="button">保存设置</button><span id="editStatus" class="muted"></span></div>
-    ${offline ? '' : `<dl><dt>费用类型特例</dt><dd>${plan.expenseTypeRules?.length ? escapeHtml(plan.expenseTypeRules.map((rule) => `${rule.keyword}→${rule.type}`).join('、')) : '无'}</dd><dt>票据</dt><dd>${plan.rows.length} 张发票，${plan.uploadFiles.length} 个上传文件（${plan.uploadSource === 'ai' ? 'AI 选定' : plan.uploadSource === 'ai-cache' ? 'AI 选定·缓存' : '规则选定'}），分 ${plan.batches.length} 批</dd><dt>检查状态</dt><dd>${plan.cacheState === 'cached' ? '文件夹无变化，复用缓存' : '已重新识别更新内容'}</dd></dl>`}
+    ${offline ? '' : `<dl><dt>费用类型特例</dt><dd>${plan.expenseTypeRules?.length ? escapeHtml(plan.expenseTypeRules.map((rule) => `${rule.keyword}→${rule.type}`).join('、')) : '无'}</dd><dt>票据</dt><dd>${plan.rows.length} 张发票，${plan.uploadFiles.length} 个上传文件（${reviewSource}），分 ${plan.batches.length} 批</dd><dt>检查状态</dt><dd>${plan.cacheState === 'cached' ? '本机取字结果已缓存' : '已读取新增或更新的附件'}。</dd></dl>`}
     <div class="${ready ? 'muted' : 'warnings'}"><strong>${executionLabel}</strong>${plan.blockers?.length ? `<ul>${plan.blockers.map((message) => `<li>${escapeHtml(message)}</li>`).join('')}</ul>` : ''}</div>
     ${warnings}
     ${renderMaterialReview(plan)}
@@ -689,9 +784,11 @@ function renderPlanDetails(plan) {
 }
 
 function openDetails(folder) {
-  if (!state.plans.has(folder)) return;
+  const plan = state.plans.get(folder);
+  if (!plan) return;
   state.detailFolder = folder;
   renderDetailModal();
+  if (paymentReviewNeeded(plan)) $('paymentReview').querySelector('summary').focus();
 }
 
 function closeDetails() {
@@ -830,6 +927,11 @@ function allocationState(folder) {
   const draft = projects.length > 1 ? [...fields.map(({ projectNo, projectName, amountCny }) => ({ projectNo, projectName, amountCny })), { ...projects.at(-1), amountCny: null }] : projects;
   const amount = state.amounts.get(folder) || {};
   const result = allocateProjects(draft, amount.totalCny);
+  if (result.error && !Number.isSafeInteger(amount.totalCny)) {
+    const plan = state.plans.get(folder);
+    result.error = paymentReviewNeeded(plan) ? '请先核对发票和付款并保存。助手会计算核定报销额。'
+      : plan?.blockers?.[0] || '请先完成材料核对。';
+  }
   return { ...result, draft, fields, amount, dirty: fields.some((field) => field.dirty), saving: savingMatches.has(key) };
 }
 
@@ -918,7 +1020,7 @@ function updateSelectionCount() {
     if (item?.didi) return !item.didi.blocker && cleanReason(reasonEntry(folder).text) === reasonEntry(folder).confirmed;
     return state.plans.get(folder)?.status === 'ready' && state.plans.get(folder).reason === cleanReason(reasonEntry(folder).text) && !allocationState(folder).dirty;
   }).length;
-  $('selectionCount').textContent = count ? `已选 ${count} 个报销事项 · ${ready} 个可执行` : '勾选中间的报销事项后批量执行';
+  $('selectionCount').textContent = count ? `已选 ${count} 个报销事项 · ${state.blockingRun ? '有一笔原任务待处理' : `${ready} 个可执行`}` : '勾选中间的报销事项后批量执行';
   $('mergeClaims').disabled = selected.filter((folder) => !singleProjectClaim(itemFor(folder))).length < 2;
 }
 
@@ -1023,7 +1125,7 @@ function renderRows() {
       <div class="folder-actions">
         <button class="secondary match-row" type="button" aria-label="匹配经费 ${label}" aria-pressed="${current}">匹配经费</button>
         ${item.didi ? '<button class="secondary" type="button" data-edit-didi>修改预算</button><button class="text-button" type="button" data-remove-didi>移除</button>'
-          : `<button class="secondary detail-row" type="button" ${plan ? '' : 'disabled'}>详情</button>`}
+          : `<button class="secondary detail-row" type="button" ${plan ? '' : 'disabled'}>${paymentReviewNeeded(plan) ? '核对发票和付款' : '详情'}</button>`}
       </div>
       ${item.didi ? '' : renderClaimSources(item)}
       ${renderReasonForm(folder)}
@@ -1123,7 +1225,7 @@ async function prepareFolder(folder) {
       const result = await api('/api/plans', {
         method: 'POST',
         body: JSON.stringify({
-          folder, subject: config.subject, funding: config.funding, project,
+          sourceRoot: state.sourceRoot, folder, subject: config.subject, funding: config.funding, project,
           travelProfile: config.subject === '差旅' ? { role: config.travelRole, fundType: config.travelFundType } : undefined,
         }),
       });
@@ -1136,7 +1238,10 @@ async function prepareFolder(folder) {
       }
       storeCheckedPlan(plan);
       if (matchUpdated || $('claimRouteFilter').value) renderRows();
-      else updateRowInPlace(folder);
+      else {
+        updateRowInPlace(folder);
+        if (plan.sourceFolders?.length) renderSources();
+      }
       return plan.status === 'ready';
     } catch (error) {
       if (config.version === version && generation === state.configurationGeneration) {
@@ -1176,24 +1281,39 @@ async function checkSelected() {
 
 async function autoCheckAll() {
   if (state.demoMode) return;
-  if (state.autoChecking) { state.recheckRequested = true; return; }
-  state.autoChecking = true;
   const generation = state.configurationGeneration;
-  const pending = state.folders.filter((item) => !item.reimbursed && !singleProjectClaim(item));
+  if (state.autoChecking?.generation === generation) return state.autoChecking.promise;
+  const previous = state.autoChecking;
+  const task = { generation, promise: null };
+  state.autoChecking = task;
+  task.promise = (async () => {
+    await previous?.promise;
+    if (generation !== state.configurationGeneration) return;
+    await checkWorklist(generation);
+  })();
+  try { await task.promise; }
+  finally { if (state.autoChecking === task) state.autoChecking = null; }
+}
+
+async function checkWorklist(generation) {
   setWorklistStatus('正在核对来源材料和报销事项。可同时合并文件夹、填写事由和匹配经费。');
-  for (const { path } of pending) {
-    if (generation !== state.configurationGeneration) break;
-    await prepareFolder(path);
-  }
-  for (const item of state.sourceFolders.filter((source) => !source.reimbursed && !state.sourceAmounts.has(source.path))) {
-    if (generation !== state.configurationGeneration) break;
+  const keyword = $('sourceFilter').value.trim().toLowerCase();
+  const sources = state.sourceFolders.filter((item) => !item.reimbursed && !state.sourceAmounts.has(item.path) &&
+    !(item.claimKey && configFor(item.claimKey).subject === '劳务费'));
+  if (keyword) sources.sort((a, b) => Number(b.path.toLowerCase().includes(keyword)) - Number(a.path.toLowerCase().includes(keyword)));
+  for (const item of sources) {
+    if (generation !== state.configurationGeneration) return;
     await prepareSource(item, generation);
   }
-  if (generation === state.configurationGeneration) {
-    setWorklistStatus('事项核对完成。保存事由并匹配经费后，可勾选批量执行。');
+  for (const { path } of state.folders.filter((item) => !item.reimbursed && !singleProjectClaim(item))) {
+    if (generation !== state.configurationGeneration) return;
+    await prepareFolder(path);
   }
-  state.autoChecking = false;
-  if (state.recheckRequested) { state.recheckRequested = false; return autoCheckAll(); }
+  if (generation === state.configurationGeneration) {
+    const failed = [...state.sourceAmounts.values()].filter((amount) => amount.error).length + [...state.rowStatus.values()].filter(({ type }) => type === 'error').length;
+    setWorklistStatus(failed ? `${failed} 个文件夹或事项检查失败，请查看各行提示。`
+      : '事项核对完成。保存事由并匹配经费后，可勾选批量执行。');
+  }
 }
 
 function showExecutionFeedback(message, { blocked = true, folder = '', focusReason = false, allocation = false, openRun = false, reveal = true } = {}) {
@@ -1205,7 +1325,8 @@ function showExecutionFeedback(message, { blocked = true, folder = '', focusReas
   details.dataset.folder = folder;
   details.dataset.openRun = String(openRun);
   details.dataset.allocation = String(allocation);
-  details.textContent = openRun ? '查看执行进度' : allocation ? '查看分配' : '查看详情';
+  details.textContent = openRun ? '查看执行进度' : allocation ? '查看分配'
+    : paymentReviewNeeded(state.plans.get(folder)) ? '核对发票和付款' : '查看详情';
   details.hidden = !openRun && !allocation && (!folder || !state.plans.has(folder));
   if (!blocked || !reveal) return;
   feedback.scrollIntoView({ block: 'nearest' });
@@ -1226,6 +1347,14 @@ async function executeSelected() {
     return;
   }
   const selected = selectedFolders();
+  if (state.blockingRun) {
+    const run = state.blockingRun;
+    const resumeSelected = selected.includes(run.plan.folder) && run.canResumePreview && !otherRunYear(run);
+    showExecutionFeedback(resumeSelected ? '这笔事项已有原草稿。请从「执行与互动」继续原草稿。' : blockingRunText(run),
+      { openRun: true });
+    if (resumeSelected) setRunDrawer(true);
+    return;
+  }
   const direct = selected.map(itemFor).filter(singleProjectClaim);
   const folders = selected.filter((folder) => !singleProjectClaim(itemFor(folder)));
   if (selected.some((folder) => savingMatches.has(projectMatchKey(state.sourceRoot, folder)))) {
@@ -1242,6 +1371,23 @@ async function executeSelected() {
     showExecutionFeedback(`${incomplete.label} · ${(incomplete.payroll || incomplete.didi).blocker || '请先保存或更新用车事由'}`, { folder: incomplete.path, focusReason: Boolean(incomplete.didi && incomplete.match) });
     return;
   }
+  const missing = folders.filter((folder) => !state.plans.has(folder));
+  if (missing.length) {
+    showExecutionFeedback(`尚未启动。以下事项需要先检查材料。\n${missing.map(displayNameFor).join('、')}`);
+    return;
+  }
+  const pendingAmounts = folders.filter((folder) => {
+    const plan = state.plans.get(folder);
+    return paymentReviewNeeded(plan) || (plan.status !== 'ready' && !Number.isSafeInteger(plan.totalCny));
+  });
+  if (pendingAmounts.length) {
+    const messages = pendingAmounts.map((folder) => {
+      const plan = state.plans.get(folder);
+      return `${displayNameFor(folder)} · ${plan.blockers?.[0] || '请查看金额核对结果'}`;
+    });
+    showExecutionFeedback(`尚未启动。请先核对以下事项的材料和金额。\n${messages.join('\n')}`, { folder: pendingAmounts[0] });
+    return;
+  }
   const unmatched = folders.filter((folder) => !projectForFolder(folder));
   if (unmatched.length) {
     showExecutionFeedback(`请先为以下报销事项匹配经费项目。\n${unmatched.map(displayNameFor).join('、')}`, { folder: unmatched[0] });
@@ -1255,11 +1401,6 @@ async function executeSelected() {
   if (unallocated.length) {
     const messages = unallocated.map((folder) => `${displayNameFor(folder)} · ${allocationState(folder).error || '请先保存经费分配'}`);
     showExecutionFeedback(`请先完成中栏的经费分配。\n${messages.join('\n')}`, { folder: unallocated[0], allocation: true });
-    return;
-  }
-  const missing = folders.filter((folder) => !state.plans.has(folder));
-  if (missing.length) {
-    showExecutionFeedback(`尚未启动。以下文件夹需要先完成核对。\n${missing.join('、')}`);
     return;
   }
   const editedReasons = folders.filter((folder) => {
@@ -1297,7 +1438,7 @@ async function executeSelected() {
     state.batch = result.batch;
     state.run = null;
     setRunDrawer(true);
-    showExecutionFeedback(`批次已启动，共 ${result.batch.runs.length} 笔。执行器会依次填报并提交。进度见“执行与互动”。${reminderText}`, { blocked: false, folder: reminderFolder });
+    showExecutionFeedback(`批次已启动，共 ${result.batch.runs.length} 笔。请在「执行与互动」核对并逐笔确认提交。${reminderText}`, { blocked: false, folder: reminderFolder });
     renderRun();
   } catch (error) {
     if (/已失效/.test(error.message)) {
@@ -1316,7 +1457,7 @@ async function executeSelected() {
       const failed = folders.find((folder) => state.plans.get(folder)?.status !== 'ready');
       showExecutionFeedback(`重新检查完成 ${recovered}/${folders.length} 个。请查看尚未通过的文件夹。`, { folder: failed });
     } else {
-      showExecutionFeedback(`批次启动失败。${error.message}`);
+      showExecutionFeedback(`批次启动失败。${error.message}`, { openRun: /草稿|财务浏览器|原单/.test(error.message) });
     }
   } finally {
     state.executing = false;
@@ -1325,7 +1466,7 @@ async function executeSelected() {
 }
 
 const runStatusLabels = { queued: '排队中', running: '执行中', waiting_input: '等待你的回复', pausing: '将在当前步骤后暂停', error: '执行暂停', completed: '已提交', preview: '已停在提交前', idle: '尚未执行', verification_required: '结果待核实', stopped: '已停止排队', abandoned: '已结束草稿' };
-const batchStatusLabels = { queued: '排队中', running: '执行中', completed: '已完成', completed_with_errors: '已完成但有失败', error: '失败', preview: '停在提交前', verification_required: '结果待核实', interrupted: '重启后已停止' };
+const batchStatusLabels = { queued: '排队中', running: '执行中', completed: '已完成', completed_with_errors: '已完成但有失败', error: '失败', preview: '停在提交前', verification_required: '结果待核实', interrupted: '重启后已停止', abandoned: '草稿已结束' };
 const waitingForCampusLogin = (run) => run.status === 'running' && run.waitingForCampusLogin;
 const runStatusLabel = (run) => {
   if (waitingForCampusLogin(run)) return '等待校园网登录';
@@ -1342,6 +1483,18 @@ function runReference(run) {
   return number ? `${label} · 学校单号 ${number}` : label;
 }
 
+function otherRunYear(run) {
+  return run?.year && state.workspace && run.year !== state.workspace.year ? run.year : null;
+}
+
+function blockingRunText(run) {
+  const year = otherRunYear(run);
+  const next = year ? `请切回 ${year} 年度处理原任务。`
+    : run.canResumePreview ? '可查看并继续原草稿。作废或删除原草稿后，也可登记结束。'
+    : '请查看原任务，核对学校原单状态。';
+  return `当前有一笔任务待处理 · ${runReference(run)} · ${runStatusLabel(run)}。${next}`;
+}
+
 function executionError(value) {
   return String(value || '').replace(/\x1b\[[\d;]*m/g, '').replace(/\s*Call log:[\s\S]*$/, '').trim();
 }
@@ -1356,9 +1509,20 @@ function currentRun() {
   return state.run;
 }
 
+function canRecordSubmission(run) {
+  return run?.canEndDraft && run.plan.reimbursementRoute === 'smart' && !run.plan.didi && !run.plan.payrollRevision;
+}
+
 function renderRun() {
   const run = currentRun();
-  $('submissionActions').hidden = run?.pendingKind !== 'final_approval';
+  const year = otherRunYear(run);
+  $('submissionActions').hidden = Boolean(year) || run?.pendingKind !== 'final_approval';
+  $('draftActions').hidden = Boolean(year) || (!run?.canResumePreview && !run?.canEndDraft);
+  $('resumeDraft').hidden = !run?.canResumePreview;
+  $('endDraft').hidden = !run?.canEndDraft;
+  $('recordSubmission').hidden = !canRecordSubmission(run);
+  $('replyForm').hidden = Boolean(year);
+  if ($('draftActionStatus').dataset.runId !== run?.id) $('draftActionStatus').hidden = true;
   if (!run) {
     $('runStatus').className = 'run-status idle';
     $('runStatus').textContent = '尚未执行';
@@ -1371,8 +1535,10 @@ function renderRun() {
   $('runStatus').className = `run-status ${waitingLogin ? 'waiting_input' : run.status}`;
   const started = new Date(state.batch?.createdAt || run.createdAt);
   const time = Number.isFinite(started.getTime()) ? started.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+  const batchStatus = state.batch?.status === 'error' && state.batch.runs.every((item) => item.status === 'completed')
+    ? 'completed' : state.batch?.status;
   const batchText = state.batch
-    ? `批次${batchStatusLabels[state.batch.status] || state.batch.status} · 第 ${Math.min((state.batch.currentIndex ?? 0) + 1, state.batch.runs.length)}/${state.batch.runs.length} 笔 · `
+    ? `批次${batchStatusLabels[batchStatus] || batchStatus} · 第 ${Math.min((state.batch.currentIndex ?? 0) + 1, state.batch.runs.length)}/${state.batch.runs.length} 笔 · `
     : '';
   const error = executionError(run.error);
   $('runStatus').textContent = `${batchText}${time ? `${time} 启动 · ` : ''}${runStatusLabel(run)} · ${runReference(run)}${error ? ` · ${error}` : ''}`;
@@ -1382,6 +1548,7 @@ function renderRun() {
   }).join('') : '';
   $('timeline').innerHTML = run.events.slice(-14).reverse().map((event) => `<div class="event"><time>${new Date(event.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</time><span>${escapeHtml(event.step)}${event.detail ? ` · ${escapeHtml(event.detail)}` : ''}</span></div>`).join('');
   $('messages').innerHTML = run.messages.length ? run.messages.map((message) => `<div class="message ${message.role}">${escapeHtml(message.text)}</div>`).join('') : '<div class="empty-chat">执行已经开始，等待网页反馈。</div>';
+  if (year) $('messages').insertAdjacentHTML('beforeend', `<div class="empty-chat">请切回 ${escapeHtml(year)} 年度处理原任务。</div>`);
   if (run.pendingChoices?.length) $('messages').insertAdjacentHTML('beforeend', `<div class="payroll-choices">${run.pendingChoices.map(({ value, label }) =>
     `<button type="button" class="secondary" data-run-choice="${escapeHtml(value)}">${escapeHtml(value + '. ' + label)}</button>`).join('')}</div>`);
   if (run.appointment?.pdfName) $('messages').insertAdjacentHTML('beforeend', `<a href="/api/runs/${escapeHtml(run.id)}/appointment-pdf" target="_blank" rel="noopener">查看报销单 PDF</a>`);
@@ -1421,8 +1588,45 @@ async function sendRunMessage(message) {
   }
 }
 
-async function refreshFolders() {
-  const result = await api('/api/folders');
+async function updateOriginalDraft(action) {
+  const run = currentRun();
+  if (!run || otherRunYear(run)) return;
+  const resume = action === 'resume';
+  const submitted = action === 'submitted';
+  if (!(resume ? run.canResumePreview : submitted ? canRecordSubmission(run) : run.canEndDraft)) return;
+  const status = $('draftActionStatus');
+  if ($('resumeDraft').disabled) return;
+  if (action === 'abandon_draft' && !window.confirm('请确认你已在学校系统作废或删除了这张草稿，并核实从未提交。登记后可开始其他事项。')) return;
+  const financeFormId = submitted ? window.prompt(`请核对「${runReference(run)}」已在学校提交，并填入该笔回执上的学校报销单号。`)?.trim() : undefined;
+  if (submitted && !financeFormId) return;
+  status.dataset.runId = run.id;
+  status.hidden = false;
+  status.textContent = resume ? '正在接回原草稿…' : '正在保存核实结果…';
+  $('resumeDraft').disabled = $('endDraft').disabled = $('recordSubmission').disabled = true;
+  try {
+    const result = resume
+      ? await api(`/api/runs/${run.id}/instructions`, { method: 'POST', body: JSON.stringify({ message: '继续' }) })
+      : await api(`/api/runs/${run.id}/resolution`, { method: 'POST', body: JSON.stringify({ confirmed: true, resolution: action, financeFormId }) });
+    if (!submitted) {
+      if (result.batch) state.batch = result.batch;
+      if (state.batch) {
+        const index = state.batch.runs.findIndex(({ id }) => id === run.id);
+        if (index >= 0) state.batch.runs[index] = result.run;
+      } else state.run = result.run;
+    }
+    status.textContent = resume ? '原任务已恢复，进度见上方。' : submitted
+      ? '学校回执已登记。' : '已登记原草稿作废。可返回工作清单移除事项或开始新批次。';
+    $('executionFeedback').hidden = true;
+    await refreshExecution();
+  } catch (error) {
+    status.textContent = `未能${resume ? '接回原草稿' : '登记'}。${error.message}`;
+  } finally {
+    $('resumeDraft').disabled = $('endDraft').disabled = $('recordSubmission').disabled = false;
+  }
+}
+
+async function refreshFolders(options) {
+  const result = await api('/api/folders', options);
   const { sourceRoot } = result;
   const generation = ++state.configurationGeneration;
   if (state.sourceRoot !== sourceRoot) {
@@ -1438,6 +1642,8 @@ async function refreshFolders() {
   state.amounts.clear();
   state.rowStatus.clear();
   state.sourceFolders = result.folders;
+  $('receiptDirectory').textContent = sourceRoot;
+  $('editReceiptDirectory').hidden = !state.workspace || state.workspace.example;
   state.payrollCategories = result.payrollCategories || [];
   state.payrollPositions = result.payrollPositions || [];
   state.payrollExpenseItems = result.payrollExpenseItems || [];
@@ -1491,7 +1697,20 @@ async function refreshExecution() {
     const completedRunIds = orderedRuns.filter(({ status }) => status === 'completed').map(({ id }) => id).sort().join(',');
     if (state.completedRunIds !== null && state.completedRunIds !== completedRunIds) loadFundingSummary();
     state.completedRunIds = completedRunIds;
-    const actionable = orderedRuns.find((run) => ACTIVE_RUN_STATUSES.has(run.status) || ['preview', 'verification_required'].includes(run.status));
+    const blocking = orderedRuns.find(({ id }) => id === runResult.blockingRunId) || null;
+    const previousBlocker = state.blockingRun;
+    state.blockingRun = blocking;
+    $('blockingRunNotice').hidden = !blocking;
+    if (blocking) $('blockingRunMessage').textContent = blockingRunText(blocking);
+    if (previousBlocker?.id !== blocking?.id || previousBlocker?.status !== blocking?.status) {
+      const changed = [...new Set([previousBlocker?.plan.folder, blocking?.plan.folder])].filter(Boolean);
+      for (const folder of changed) {
+        if (folderRow(folder)?.querySelector('.row-state')) updateRowInPlace(folder);
+      }
+      updateSelectionCount();
+      if (!blocking && $('executionDetails').dataset.openRun === 'true') $('executionFeedback').hidden = true;
+    }
+    const actionable = blocking || orderedRuns.find((run) => ACTIVE_RUN_STATUSES.has(run.status) || ['preview', 'verification_required'].includes(run.status));
     const selected = actionable || orderedRuns[0] || null;
     const matchedBatch = selected ? [...batchResult.batches].reverse().find((batch) => batch.runs.some((run) => run.id === selected.id)) : batchResult.batches.at(-1);
     state.batch = matchedBatch ? { ...matchedBatch, currentRunId: actionable?.id || matchedBatch.currentRunId } : null;
@@ -1576,8 +1795,11 @@ function toggleSelectAll() {
 }
 
 function renderBasicSettings(result) {
+  state.workspace = result.workspace ?? null;
+  selectConfigStorage(state.workspace);
   state.defaultSourceRoot = result.defaultSourceRoot;
   $('sourceRoot').value = result.sourceRoot;
+  $('sourceRoot').readOnly = Boolean(state.workspace);
   if (result.preferences) {
     const { signers, campus, autoPrint, smartPaymentLabel, legacyPaymentLabel, researchProjectNos } = result.preferences;
     $('teachingSigner').value = signers['教学']?.name || '';
@@ -1591,20 +1813,97 @@ function renderBasicSettings(result) {
     $('researchProjectNos').value = (researchProjectNos || []).join('\n');
   }
   state.demoMode = result.demoMode === true;
+  $('openWorkspace').hidden = !state.workspace;
+  $('profileStatus').textContent = state.workspace ? `${state.workspace.owner} · ${state.workspace.year} 年度 · ${state.demoMode ? '示例资料' : '本机资料'}`
+    : state.demoMode ? '示例资料 · 本机服务已连接' : '本机资料 · 服务已连接';
   setReviewArchiveAvailable(!state.demoMode && result.reviewArchiveAvailable === true);
   $('demoIntro').hidden = !state.demoMode;
   $('schoolAccess').hidden = state.demoMode;
   $('liveWorklist').hidden = state.demoMode;
   $('fundingSync').hidden = state.demoMode;
   $('runToggle').hidden = state.demoMode;
-  $('returnToDemo').hidden = state.demoMode;
+  $('returnToDemo').hidden = state.demoMode || Boolean(state.workspace);
   $('saveRoot').textContent = state.demoMode ? '启用正式模式' : '保存基本信息';
+  $('saveRoot').hidden = Boolean(state.workspace && state.demoMode);
   if (state.demoMode) setRunDrawer(false);
   $('paymentCardLast4').placeholder = result.paymentCardConfigured ? '已配置，留空保留' : '请输入公务卡尾号 4 位';
 }
 
 async function loadConfig() {
-  renderBasicSettings(await api('/api/config'));
+  renderBasicSettings(await api('/api/config', { signal: AbortSignal.timeout(15000) }));
+}
+
+let availableOwners = [];
+
+function renderWorkspaceYears() {
+  const owner = availableOwners.find(({ name }) => name === $('workspaceOwner').value);
+  const select = $('workspaceYear');
+  const previous = select.value;
+  select.replaceChildren();
+  for (const year of owner?.years ?? []) select.add(new Option(`${year} 年度`, year));
+  if (owner && !owner.example) select.add(new Option('新建年度…', 'new'));
+  select.value = [...select.options].some(({ value }) => value === previous) ? previous
+    : owner?.name === state.workspace?.owner ? state.workspace?.year : select.options[0]?.value;
+  if (select.selectedIndex < 0 && select.options.length) select.selectedIndex = 0;
+  renderWorkspaceChoice();
+}
+
+function renderWorkspaceChoice() {
+  const newOwner = $('workspaceOwner').value === '';
+  const newYear = newOwner || $('workspaceYear').value === 'new';
+  $('newWorkspaceOwnerField').hidden = !newOwner;
+  $('newWorkspaceOwner').required = newOwner;
+  $('workspaceYearField').hidden = newOwner;
+  $('workspaceYear').required = !newOwner;
+  $('newWorkspaceYearField').hidden = !newYear;
+  $('newWorkspaceYear').required = newYear;
+  $('newWorkspaceSourceField').hidden = !newYear;
+  $('newWorkspaceSource').required = newYear;
+  $('applyWorkspace').textContent = newYear ? '创建并打开' : '打开';
+  $('workspaceDirectoryHint').textContent = newYear ? '选择已有的年度票据文件夹。助手会在使用人资料中保存路径和识别结果。' : '';
+}
+
+async function openWorkspaceChooser(create = false) {
+  const dialog = $('workspaceDialog');
+  const button = $('applyWorkspace');
+  const status = $('workspaceStatus');
+  if (!dialog.open) dialog.showModal();
+  button.disabled = true;
+  status.textContent = '正在读取本机目录…';
+  try {
+    const result = await api('/api/workspaces', { signal: AbortSignal.timeout(15000) });
+    availableOwners = result.owners;
+    const select = $('workspaceOwner');
+    select.replaceChildren(...availableOwners.map(({ name }) => new Option(name, name)), new Option('新建使用人…', ''));
+    select.value = create ? '' : result.current.owner;
+    $('newWorkspaceYear').value = String(new Date().getFullYear());
+    $('newWorkspaceSource').value = '';
+    renderWorkspaceYears();
+    status.textContent = '';
+    button.disabled = false;
+  } catch (error) { status.textContent = error.message; }
+}
+
+async function openSelectedWorkspace(event) {
+  event.preventDefault();
+  const button = $('applyWorkspace');
+  const status = $('workspaceStatus');
+  const chosen = $('workspaceOwner').value;
+  const create = !chosen || $('workspaceYear').value === 'new';
+  const owner = chosen || $('newWorkspaceOwner').value.trim();
+  const year = create ? $('newWorkspaceYear').value.trim() : $('workspaceYear').value;
+  const sourceRoot = create ? $('newWorkspaceSource').value.trim() : undefined;
+  button.disabled = true;
+  status.textContent = '正在打开本机资料…';
+  try {
+    await Promise.all([...reasonEntries.values()].filter((entry) => entry.sourceRoot === state.sourceRoot && cleanReason(entry.text) !== entry.saved)
+      .map((entry) => saveReasonDraft(entry)));
+    const { location } = await api('/api/workspaces', { method: 'POST', body: JSON.stringify({ owner, year, create, sourceRoot }) });
+    window.location.assign(location);
+  } catch (error) {
+    status.textContent = error.message;
+    button.disabled = false;
+  }
 }
 
 async function saveRoot(demoMode = false) {
@@ -1655,16 +1954,62 @@ async function saveRoot(demoMode = false) {
 }
 
 async function refreshFoldersManually() {
-  $('refreshFolders').disabled = true;
+  const button = $('refreshFolders');
+  const status = $('folderRefreshStatus');
+  button.disabled = true;
+  button.textContent = '刷新中…';
+  status.hidden = false;
+  status.textContent = '正在读取本机票据目录…';
   try {
+    const before = new Map(state.sourceAmounts);
     state.sourceAmounts.clear();
-    await refreshFolders();
+    await refreshFolders({ signal: AbortSignal.timeout(30000) });
+    const generation = state.configurationGeneration;
+    const visible = state.sourceFolders.filter((item) => !item.reimbursed).length;
     loadFundingSummary();
-    setWorklistStatus('文件夹清单已刷新，正在重新核对当前附件。');
-    autoCheckAll();
+    status.textContent = `已读取目录，正在核对 ${visible} 个待报销来源文件夹的材料和金额…`;
+    await autoCheckAll();
+    if (generation !== state.configurationGeneration) {
+      status.textContent = '票据目录已更新，请查看当前工作清单。';
+      return;
+    }
+    const results = [...state.sourceAmounts.entries()];
+    const updated = results.filter(([path, amount]) => {
+      const prior = before.get(path)?.fingerprint;
+      return amount.fingerprint && (prior ? prior !== amount.fingerprint : amount.cacheState === 'new' || amount.cacheState === 'refreshed');
+    }).length;
+    const failed = results.filter(([, amount]) => amount.error).length;
+    const awaitingSources = state.sourceFolders.filter((item) => {
+      const preview = state.sourceAmounts.get(item.path);
+      return !item.claimKey && preview && !preview.error && !Number.isSafeInteger(preview.totalCny);
+    }).length;
+    const awaitingClaims = [...state.plans.values()].filter((plan) => paymentReviewNeeded(plan) || !Number.isSafeInteger(plan.totalCny)).length;
+    status.textContent = `刷新完成。核对 ${results.length} 个来源文件夹，${updated} 个有新材料或文件变化。${awaitingSources ? `${awaitingSources} 个未合并的来源金额待核对。` : ''}${awaitingClaims ? `${awaitingClaims} 个报销事项待核对材料或金额。` : ''}${failed ? `${failed} 个识别失败，详情见对应文件夹。` : ''}`;
+  } catch (error) {
+    status.textContent = `刷新失败。${error.message}`;
   } finally {
-    $('refreshFolders').disabled = false;
+    button.disabled = false;
+    button.textContent = '刷新文件夹';
   }
+}
+
+async function saveReceiptDirectory(event) {
+  event.preventDefault();
+  const status = $('receiptDirectoryStatus');
+  const button = $('saveReceiptDirectory');
+  const previousSourceRoot = state.sourceRoot;
+  const sourceRoot = $('receiptDirectoryPath').value.trim();
+  button.disabled = true;
+  status.textContent = '正在检查原票据目录…';
+  try {
+    await Promise.all([...reasonEntries.values()].filter((entry) => entry.sourceRoot === previousSourceRoot && cleanReason(entry.text) !== entry.saved)
+      .map((entry) => saveReasonDraft(entry)));
+    const result = await api('/api/workspace-source', { method: 'POST', body: JSON.stringify({ previousSourceRoot, sourceRoot }) });
+    renderBasicSettings(result);
+    $('receiptDirectoryDialog').close();
+    await refreshFoldersManually();
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
 }
 
 async function withdrawHistoryClaim(event) {
@@ -1702,13 +2047,14 @@ async function init() {
     await refreshExecution();
     autoCheckAll();
   } catch (error) {
+    if (!$('liveWorklist').hidden || !state.workspace) $('profileStatus').textContent = `读取本机资料失败。${error.message}`;
     setWorklistStatus(error.message);
     $('folderRows').textContent = '读取失败，请检查本地服务。';
   }
 }
 
 const loadModelSettings = bindModelSettings(api);
-const loadFundingSummary = bindFundingSummary({ api, money, escapeHtml, onPayrollSync: refreshFolders });
+const loadFundingSummary = bindFundingSummary({ api, money, escapeHtml, onPayrollSync: refreshFolders, currentYear: () => state.workspace?.year });
 const setReviewArchiveAvailable = bindReviewArchive(api);
 
 async function refreshSavedClaim(folder, message, focus = true) {
@@ -1788,10 +2134,19 @@ $('openSettings').addEventListener('click', async () => {
   }
 });
 $('closeSettings').addEventListener('click', () => $('settingsDialog').close());
-$('setupLive').addEventListener('click', () => $('openSettings').click());
+$('openWorkspace').addEventListener('click', () => openWorkspaceChooser());
+$('setupLive').addEventListener('click', () => state.workspace ? openWorkspaceChooser(true) : $('openSettings').click());
+$('closeWorkspace').addEventListener('click', () => $('workspaceDialog').close());
+$('workspaceForm').addEventListener('submit', openSelectedWorkspace);
+$('workspaceOwner').addEventListener('change', renderWorkspaceYears);
+$('workspaceYear').addEventListener('change', renderWorkspaceChoice);
 $('returnToDemo').addEventListener('click', () => saveRoot(true));
 $('confirmSubmission').addEventListener('click', () => sendRunMessage('确认提交'));
 $('skipSubmission').addEventListener('click', () => sendRunMessage('先别提交'));
+$('recordSubmission').addEventListener('click', () => updateOriginalDraft('submitted'));
+$('resumeDraft').addEventListener('click', () => updateOriginalDraft('resume'));
+$('endDraft').addEventListener('click', () => updateOriginalDraft('abandon_draft'));
+$('viewBlockingRun').addEventListener('click', () => setRunDrawer(true));
 $('settingsDialog').addEventListener('close', () => { $('paymentCardLast4').value = ''; });
 $('basicSettingsForm').addEventListener('submit', (event) => {
   event.preventDefault();
@@ -1800,6 +2155,20 @@ $('basicSettingsForm').addEventListener('submit', (event) => {
 $('checkLogin').addEventListener('click', checkCampusLogin);
 $('syncProjects').addEventListener('click', syncProjects);
 $('refreshFolders').addEventListener('click', refreshFoldersManually);
+$('copyReceiptDirectory').addEventListener('click', async () => {
+  const status = $('folderRefreshStatus');
+  status.hidden = false;
+  if (!state.sourceRoot) return;
+  try { await navigator.clipboard.writeText(state.sourceRoot); status.textContent = '已复制原票据目录路径。'; }
+  catch { status.textContent = '可选中上方的原票据目录路径并复制。'; }
+});
+$('editReceiptDirectory').addEventListener('click', () => {
+  $('receiptDirectoryPath').value = state.sourceRoot;
+  $('receiptDirectoryStatus').textContent = '';
+  $('receiptDirectoryDialog').showModal();
+});
+$('receiptDirectoryForm').addEventListener('submit', saveReceiptDirectory);
+$('closeReceiptDirectory').addEventListener('click', () => $('receiptDirectoryDialog').close());
 $('historyRows').addEventListener('click', withdrawHistoryClaim);
 $('selectAll').addEventListener('click', toggleSelectAll);
 $('checkSelected').addEventListener('click', checkSelected);
@@ -1854,6 +2223,11 @@ $('folderRows').addEventListener('click', (event) => {
     return;
   }
   if (entry?.didi && event.target.closest('[data-remove-didi]')) {
+    if (state.blockingRun?.plan.folder === entry.path) {
+      showExecutionFeedback('这笔事项还有学校原草稿。请先继续原草稿，或在学校作废后登记结束，再移除。', { openRun: true });
+      setRunDrawer(true);
+      return;
+    }
     const sourceRoot = state.sourceRoot;
     const button = event.target.closest('[data-remove-didi]');
     button.disabled = true;
@@ -1866,7 +2240,8 @@ $('folderRows').addEventListener('click', (event) => {
       reasonEntries.delete(key);
       renderRows();
       setWorklistStatus('已移除这笔贸大出行。');
-    }).catch((error) => setWorklistStatus(error.message)).finally(() => { button.disabled = false; });
+    }).catch((error) => showExecutionFeedback(`移除失败。${error.message}`, { openRun: /草稿|执行|核实/.test(error.message) }))
+      .finally(() => { button.disabled = false; });
     return;
   }
   if (entry?.payroll && event.target.closest('.edit-payroll')) {
@@ -1946,9 +2321,11 @@ $('folderRows').addEventListener('submit', (event) => {
   saveClaimPurpose(event);
 });
 window.addEventListener('pagehide', () => {
+  const headers = { 'content-type': 'application/json' };
+  if (state.workspace) headers['x-reimbursement-year'] = state.workspace.year;
   for (const entry of reasonEntries.values()) {
     if (entry.sourceRoot !== state.sourceRoot || cleanReason(entry.text) === entry.saved) continue;
-    fetch('/api/claim-reason', { method: 'POST', headers: { 'content-type': 'application/json' }, body: reasonRequest(entry), keepalive: true }).catch(() => undefined);
+    fetch('/api/claim-reason', { method: 'POST', headers, body: reasonRequest(entry), keepalive: true }).catch(() => undefined);
   }
 });
 $('projectFilter').addEventListener('input', renderProjects);

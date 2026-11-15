@@ -55,6 +55,29 @@ test('equal grand totals do not excuse wrong per-invoice reimbursement amounts',
   assert.notEqual(instance.progress.detailVerified, true);
 });
 
+test('rechecking a wrong invoice breakdown keeps the run waiting until the breakdown matches', async () => {
+  const rows = [
+    { invoiceNumber: '12345678901234567890', reimbursementAmountCny: 9000 },
+    { invoiceNumber: '12345678901234567891', reimbursementAmountCny: 10000 },
+  ];
+  const replies = [];
+  const instance = executor({ plan: { totalCny: 19000, rows }, ask: async (question, metadata) => {
+    assert.equal(metadata.kind, 'amount_review');
+    replies.push(question);
+    return '继续';
+  } });
+  let reads = 0;
+  instance.detailAmountSnapshot = async () => {
+    const shown = ++reads <= 2 ? [8000, 11000] : [9000, 10000];
+    return { rows: rows.map(({ invoiceNumber }, index) => ({ invoiceNumber, amountCny: shown[index] })), remainingCny: 0 };
+  };
+  instance.bodyText = async () => rows.map(({ invoiceNumber }) => invoiceNumber).join('\n');
+  await instance.verifyDetailAmounts();
+  assert.equal(replies.length, 2);
+  assert.match(replies[0], /第 1 张应报 90.00 元，学校显示 80.00 元/);
+  assert.equal(instance.progress.detailVerified, true);
+});
+
 test('an existing draft stops immediately without reloading it', async () => {
   let reloads = 0;
   const instance = executor();

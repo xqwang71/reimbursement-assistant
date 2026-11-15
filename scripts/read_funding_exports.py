@@ -165,8 +165,8 @@ def payroll_people(root, category, key):
     return list(people.values())
 
 
-def read_exports(root):
-    year = root.name if re.fullmatch(r'20\d{2}', root.name) else ''
+def read_exports(root, selected_year=''):
+    year = selected_year if re.fullmatch(r'20\d{2}', selected_year) else root.name if re.fullmatch(r'20\d{2}', root.name) else ''
     ledgers = sorted(root.glob('20[0-9][0-9]年度进账与报销台账.xlsx')) if not year else []
     if len(ledgers) == 1:
         year = ledgers[0].name[:4]
@@ -221,4 +221,4 @@ if __name__ == '__main__':
         records = list((labor_rows if mode == '--labor' else reimbursement_rows)(*workbook[0]))
         print(json.dumps(records, ensure_ascii=False))
     else:
-        print(json.dumps(read_exports(Path(sys.argv[1])), ensure_ascii=False))
+        print(json.dumps(read_exports(Path(sys.argv[1]), sys.argv[2] if len(sys.argv) > 2 else ''), ensure_ascii=False))

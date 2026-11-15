@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cp, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, rmdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { createPlan, validatePlanForExecution } from '../lib/planner.mjs';
+import { pathToFileURL } from 'node:url';
+import { archiveReceiptFolder, createPlan, fingerprintFolder, validatePlanForExecution } from '../lib/planner.mjs';
 import { confirmClaimPurpose } from '../lib/claim-purpose.mjs';
 import { cachedFixture, concretePurpose } from './fixtures.mjs';
 
@@ -14,6 +15,18 @@ async function addSource(t, input, options) {
   await cp(join(second.appDir, '.runtime/cache', encodeURIComponent(second.folder)), join(input.appDir, '.runtime/cache', encodeURIComponent(second.folder)), { recursive: true });
   return second.folder;
 }
+
+test('archiving renames the original folder once and never replaces a conflicting directory', async (t) => {
+  const { sourceRoot, folder, fingerprint } = await cachedFixture(t);
+  const archive = folder + '-已报销';
+  await mkdir(join(sourceRoot, archive));
+  await assert.rejects(archiveReceiptFolder(sourceRoot, folder, fingerprint), /名称已被占用/);
+  assert.equal((await fingerprintFolder(sourceRoot, folder)).fingerprint, fingerprint);
+  await rmdir(join(sourceRoot, archive));
+  assert.equal(await archiveReceiptFolder(sourceRoot, folder, fingerprint), archive);
+  assert.equal(await archiveReceiptFolder(sourceRoot, folder, fingerprint), archive);
+  assert.equal((await fingerprintFolder(sourceRoot, archive)).fingerprint, fingerprint);
+});
 
 test('one grouped plan reconciles all sources and preserves same-named attachment provenance', async (t) => {
   const input = await cachedFixture(t);
@@ -99,6 +112,61 @@ test('a successful payment, including a visible discount, determines the claimed
   assert.equal(plan.paidTotalCny, 9000);
   assert.equal(plan.totalCny, 9000);
   assert.equal(plan.rows[0].reimbursementAmountCny, 9000);
+});
+
+test('cached invoice text normalizes spaces within the label, number, amount and date', async (t) => {
+  const input = await cachedFixture(t, { order: null });
+  const cachePath = join(input.appDir, '.runtime', 'cache', encodeURIComponent(input.folder), `${input.fingerprint}.json`);
+  const cache = JSON.parse(await readFile(cachePath, 'utf8'));
+  const invoice = cache.documents.find((item) => item.kind === 'invoice');
+  const number = invoice.invoiceNumber;
+  invoice.text = [
+    '打印日期：2025年1月2日',
+    `发 票\t号　码 ：${number.match(/.{4}/g).join(' ')}`,
+    `订单编号：${invoice.orderNumber}       12345`,
+    '价 税 合 计 （ 小 写 ） ￥ 1 0 0 . 0 0',
+    '开 票 日 期 ：2 0 2 6 年 1 1 月 0 1 日',
+  ].join('\n');
+  invoice.invoiceNumber = null;
+  invoice.invoiceAmountCny = null;
+  await writeFile(cachePath, JSON.stringify(cache));
+
+  const plan = await createPlan(input);
+  assert.equal(plan.cacheState, 'cached');
+  assert.equal(plan.rows.length, 1);
+  assert.equal(plan.rows[0].invoiceNumber, number);
+  assert.equal(plan.rows[0].orderNumber, invoice.orderNumber);
+  assert.equal(plan.rows[0].date, '2026-11-01');
+  assert.equal(plan.invoiceTotalCny, 10000);
+  assert.equal(plan.totalCny, 9000);
+});
+
+test('refresh reuses unchanged document text and recalculates a replaced payment', async (t) => {
+  const input = await cachedFixture(t, { payment: null });
+  const cacheFile = join(input.appDir, '.runtime/cache', encodeURIComponent(input.folder), `${input.fingerprint}.json`);
+  const initial = await fingerprintFolder(input.sourceRoot, input.folder);
+  const raw = JSON.parse(await readFile(cacheFile, 'utf8'));
+  for (const doc of raw.documents) doc.file = initial.files.find((file) => file.name === doc.file.name);
+  await writeFile(cacheFile, JSON.stringify(raw));
+  // Reuse the same public OCR entry point with a synthetic reader for text fixtures.
+  const program = new URL('../', import.meta.url);
+  const code = join(input.appDir, 'code');
+  for (const directory of ['lib', 'public', 'scripts']) await cp(new URL(directory, program), join(code, directory), { recursive: true });
+  await writeFile(join(code, 'package.json'), '{"type":"module"}');
+  await writeFile(join(code, 'scripts', 'rapid_ocr.py'), `from pathlib import Path\nimport json, sys\nitems=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))['files']\nassert all(item['name'] == 'payment.txt' for item in items)\nPath(sys.argv[2]).write_text(json.dumps({'files':[{'name':item['name'],'pages':[Path(item['path']).read_text(encoding='utf-8')]} for item in items]}), encoding='utf-8')\n`);
+  const { createPlan: planFromFixtures } = await import(pathToFileURL(join(code, 'lib', 'planner.mjs')));
+  const payment = join(input.batchDir, 'payment.txt');
+  const evidence = '交易成功\n交易金额：75.25\n订单编号：1234567890123456';
+  await writeFile(payment, evidence);
+  const checked = await planFromFixtures(input);
+  assert.equal(checked.cacheState, 'new');
+  assert.equal(checked.totalCny, 7525);
+  await writeFile(payment, evidence.replace('75.25', '89.50'));
+  const updated = await planFromFixtures(input);
+  assert.notEqual(updated.fingerprint, checked.fingerprint);
+  assert.equal(updated.invoiceTotalCny, 10000);
+  assert.equal(updated.totalCny, 8950);
+  assert.equal((await planFromFixtures(input)).cacheState, 'cached');
 });
 
 test('a payment can establish the amount when the invoice has no matching order', async (t) => {

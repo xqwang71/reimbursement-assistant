@@ -1,4 +1,4 @@
-export function bindFundingSummary({ api, money, escapeHtml, onPayrollSync }) {
+export function bindFundingSummary({ api, money, escapeHtml, onPayrollSync, currentYear }) {
   const field = (id) => document.getElementById(id);
   const status = field('fundingStatus');
   const refresh = field('fundingRefresh');
@@ -90,12 +90,20 @@ export function bindFundingSummary({ api, money, escapeHtml, onPayrollSync }) {
         <td>${escapeHtml(record.date || '—')}</td>
         <td><strong>${escapeHtml(record.financeId)}</strong>${record.reason ? `<small>${escapeHtml(record.reason)}</small>` : ''}${record.projectText ? `<small>${escapeHtml(record.projectText)}</small>` : ''}</td>
         <td>${escapeHtml(summary.categories[record.category])}</td><td>${amount(record.amountCny)}</td>
-        <td>${escapeHtml(record.status || '—')}${record.state === 'pending' ? `<small class="funding-pending">${record.countsTowardProgress ? '已提交待入账' : '提交状态待核对'}</small>` : ''}</td>
+        <td>${escapeHtml(record.status || '—')}${record.state === 'pending' ? `<small class="funding-pending">${record.countsTowardProgress ? '已提交待入账' : '提交状态待核对'}</small>` : ''}
+          ${record.state === 'withdrawn' ? `<small>学校导出状态 ${escapeHtml(record.originalStatus || '—')} · 已排除出执行率</small>` : ''}${withdrawalAction(record)}</td>
         <td>${escapeHtml(location(record.source))}${record.allocationSource ? `<small>${escapeHtml(record.allocationSource)}</small>` : ''}</td>
         ${canAttribute ? `<td><select data-funding-record="${escapeHtml(record.key)}" data-saved-value="${escapeHtml(record.ledgerNo)}" aria-label="单据 ${escapeHtml(record.financeId)} 的台账名目">
           <option value="">待归属</option>${project.lines.map(({ ledgerNo, name }) => `<option value="${escapeHtml(ledgerNo)}"${record.ledgerNo === ledgerNo ? ' selected' : ''}>${escapeHtml(name)} · ${escapeHtml(ledgerNo)}</option>`).join('')}
         </select></td>` : ''}
       </tr>`).join('')}</tbody></table></div>`;
+  }
+
+  function withdrawalAction(record) {
+    if (summary.demoMode) return '';
+    const restore = record.state === 'withdrawn' && record.restorable;
+    if (!restore && (record.state !== 'pending' || !['smart', 'legacy'].includes(record.kind))) return '';
+    return `<button type="button" class="text-button" data-funding-withdrawal="${escapeHtml(record.financeId)}" data-restore="${restore}">${restore ? '取消撤回登记' : '登记已撤回'}</button>`;
   }
 
   function ledgerLines(project) {
@@ -147,6 +155,11 @@ export function bindFundingSummary({ api, money, escapeHtml, onPayrollSync }) {
     const newRoot = summary?.sourceRoot !== result.sourceRoot;
     const opened = new Set(summary?.sourceRoot === result.sourceRoot ? [...projects.querySelectorAll('[data-funding-project][open]')].map((node) => node.dataset.fundingProject) : []);
     summary = result;
+    const year = currentYear();
+    const yearQuery = year ? `&year=${encodeURIComponent(year)}` : '';
+    for (const link of field('fundingData').querySelectorAll('[data-funding-export]')) {
+      link.href = `/api/funding-summary?export=${link.dataset.fundingExport}${yearQuery}`;
+    }
     const { totals } = result;
     const latestSchoolDate = result.sources.filter(({ kind }) => kind !== 'runner').map(({ lastDate }) => lastDate || '').sort().at(-1);
     field('fundingPeriod').textContent = [result.demoMode ? '虚构示例' : '', result.year ? `${result.year} 年度` : '当前票据目录', latestSchoolDate ? `学校表最晚记录 ${latestSchoolDate}` : ''].filter(Boolean).join(' · ');
@@ -178,7 +191,7 @@ export function bindFundingSummary({ api, money, escapeHtml, onPayrollSync }) {
         : source.state === 'missing' ? '未在年度票据目录找到' : source.message;
       const downloadable = ['smart', 'legacy', 'labor'].includes(source.kind) || (result.demoMode && source.kind === 'budget');
       const link = source.state === 'read' && downloadable
-        ? `　<a href="/api/funding-summary/source?file=${encodeURIComponent(source.file)}" download>${source.kind === 'budget' ? '下载台账模板' : result.demoMode ? '下载示例 Excel' : '下载原始 Excel'}</a>` : '';
+        ? `　<a href="/api/funding-summary/source?file=${encodeURIComponent(source.file)}${yearQuery}" download>${source.kind === 'budget' ? '下载台账模板' : result.demoMode ? '下载示例 Excel' : '下载原始 Excel'}</a>` : '';
       return `<li><strong>${escapeHtml(source.file)}</strong>　${escapeHtml(info)}${link}</li>`;
     }).join('');
     field('fundingContent').hidden = false;
@@ -222,6 +235,24 @@ export function bindFundingSummary({ api, money, escapeHtml, onPayrollSync }) {
       status.textContent = `保存归属失败。${error.message}`;
     } finally {
       select.disabled = false;
+    }
+  });
+  field('fundingContent').addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-funding-withdrawal]');
+    if (!button) return;
+    const financeId = button.dataset.fundingWithdrawal;
+    const restore = button.dataset.restore === 'true';
+    if (!restore && !window.confirm(`确认学校单据 ${financeId} 已撤回或作废？登记后会从本机进度中排除。`)) return;
+    button.disabled = true;
+    try {
+      await api('/api/funding-summary/withdrawal', { method: restore ? 'DELETE' : 'POST', body: JSON.stringify({
+        sourceRoot: summary.sourceRoot, financeId, confirmed: true,
+      }) });
+      await load();
+    } catch (error) {
+      status.textContent = `登记未保存。${error.message}`;
+    } finally {
+      button.disabled = false;
     }
   });
   return load;

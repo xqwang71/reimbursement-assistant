@@ -37,6 +37,7 @@
 .edit-actions { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 
 .worklist-panel > .panel-title { justify-content: space-between; align-items: flex-start; }
+.header-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
 .settings-trigger { padding: 8px 16px; border: 1px solid #6e86a7; border-radius: 8px; color: #fff; background: #223e66; }
 .settings-trigger:hover { background: #2d4b75; }
 .settings-dialog { width: min(760px, calc(100% - 24px)); max-height: 92dvh; padding: 0; border: 1px solid #dce5ef; border-radius: 14px; color: #17233a; background: #fff; box-shadow: 0 22px 80px #142d543d; }
@@ -70,8 +71,7 @@
 #payrollForm textarea { padding: 8px; border: 1px solid #ccd5e1; border-radius: 7px; font: inherit; resize: vertical; }
 #payrollSigner { align-self: center; width: 100%; padding: 8px 9px; color: #173f72; }
 @media (max-width: 600px) {
-  .topbar { position: relative; padding-right: 100px; }
-  .settings-trigger { position: absolute; top: 24px; right: 18px; }
+  .header-actions { justify-content: flex-start; margin-top: 10px; }
   .settings-dialog .modal-header, .settings-content { padding-left: 16px; padding-right: 16px; }
   .settings-columns, .basic-settings-fields { grid-template-columns: 1fr; gap: 12px; }
   .settings-assignments { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -91,6 +91,8 @@ summary { cursor: pointer; }
 .school-status, .school-actions { flex-wrap: wrap; }
 .school-actions { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .text-button { padding: 0; border: 0; background: none; color: #245d9d; text-decoration: underline; }
+.receipt-directory { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; margin: 4px 0 12px; font-size: 13px; }
+.receipt-directory span { min-width: 0; overflow-wrap: anywhere; }
 .match-target { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; padding: 9px 10px; border-radius: 7px; background: #e8f1fd; color: #173f72; }
 .match-target strong { overflow-wrap: anywhere; }
 .match-target span, .match-target small { font-size: 12px; }
