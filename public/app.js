@@ -1491,7 +1491,7 @@ async function executeSelected() {
 }
 
 const runStatusLabels = { queued: '排队中', running: '执行中', waiting_input: '等待你的回复', pausing: '将在当前步骤后暂停', error: '执行暂停', completed: '已提交', preview: '已停在提交前', idle: '尚未执行', verification_required: '结果待核实', stopped: '已停止排队', abandoned: '已结束草稿' };
-const batchStatusLabels = { queued: '排队中', running: '执行中', completed: '已完成', completed_with_errors: '已完成但有失败', error: '失败', preview: '停在提交前', verification_required: '结果待核实', interrupted: '重启后已停止', abandoned: '草稿已结束' };
+const batchStatusLabels = { queued: '排队中', running: '执行中', paused: '等待继续', completed: '已完成', completed_with_errors: '已完成但有失败', error: '失败', preview: '停在提交前', verification_required: '结果待核实', interrupted: '重启后已停止', abandoned: '草稿已结束' };
 const waitingForCampusLogin = (run) => run.status === 'running' && run.waitingForCampusLogin;
 const runStatusLabel = (run) => {
   if (waitingForCampusLogin(run)) return '等待校园网登录';
@@ -1579,8 +1579,9 @@ function renderRun() {
   if (run.appointment?.pdfName) $('messages').insertAdjacentHTML('beforeend', `<a href="/api/runs/${escapeHtml(run.id)}/appointment-pdf" target="_blank" rel="noopener">查看报销单 PDF</a>`);
   $('messages').scrollTop = $('messages').scrollHeight;
   $('replyInput').placeholder = waitingLogin ? '请在报销专用 Chrome 登录，登录后自动继续'
+    : batchStatus === 'paused' ? '回复「继续」接续本批次剩余报销'
     : run.pendingQuestion ? '回复当前问题；也可输入“暂停”或“先别提交”' : '暂停、继续、重试、别提交，或询问执行状态';
-  const needsAttention = waitingLogin || ['waiting_input', 'error', 'pausing', 'verification_required', 'preview'].includes(run.status);
+  const needsAttention = waitingLogin || batchStatus === 'paused' || ['waiting_input', 'error', 'pausing', 'verification_required', 'preview'].includes(run.status);
   $('runBadge').hidden = !needsAttention || !$('runDrawer').hidden;
 }
 

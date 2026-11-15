@@ -10,6 +10,7 @@ import { chromium } from 'playwright';
 import { browserTargetId } from '../lib/browser-session.mjs';
 import { browserExecutable, pythonExecutable } from '../lib/platform.mjs';
 import { ReimbursementExecutor } from '../lib/executor.mjs';
+import { didiInvoiceWindow } from '../lib/didi-invoices.mjs';
 import { readWebProjectCatalog } from '../lib/projects.mjs';
 import { officialQuote } from '../lib/boc-rates.mjs';
 import { concretePurpose } from './fixtures.mjs';
@@ -1419,8 +1420,9 @@ async function setup(t, phase = 'confirm') {
 
 test('Didi wallet loads all same-day cards, uses the project cap, and submits in its own school category', async (t) => {
   const { instance, page, frame, plan } = await setup(t, 'start');
-  const tickets = [7000, 5900, 4000, 10000, 9999].map((amountCny, index) => ({
-    invoiceNumber: String(1234567890123450 + index), amountCny, date: '2026-11-04',
+  const { firstYear, lastYear } = didiInvoiceWindow();
+  const tickets = [7000, 5900, 3800, 10000, 9999, 9900].map((amountCny, index) => ({
+    invoiceNumber: String(1234567890123450 + index), amountCny, date: index === 5 ? `${firstYear - 1}-12-31` : `${lastYear}-01-04`,
   }));
   Object.assign(plan, {
     subject: '贸大出行', claimType: '贸大出行', expenseType: '市内差旅费',
@@ -1478,7 +1480,7 @@ test('Didi wallet loads all same-day cards, uses the project cap, and submits in
         }
         case 'wallet': {
           event.target.remove();
-          app.insertAdjacentHTML('beforeend', '<div role="dialog" aria-label="选择发票"><div class="floder-item"><div class="floder-name" data-didi="folder">滴滴平台</div><div>共5张票据|已选0张</div></div><div class="bill-list"></div><footer class="el-dialog__footer"><span>已选影像数量：0合计金额：0.00</span><button data-didi="confirm-wallet">确认</button></footer></div>');
+          app.insertAdjacentHTML('beforeend', '<div role="dialog" aria-label="选择发票"><div class="floder-item"><div class="floder-name" data-didi="folder">滴滴平台</div><div>共' + tickets.length + '张票据|已选0张</div></div><div class="bill-list"></div><footer class="el-dialog__footer"><span>已选影像数量：0合计金额：0.00</span><button data-didi="confirm-wallet">确认</button></footer></div>');
           break;
         }
         case 'folder': {
@@ -1537,7 +1539,7 @@ test('Didi wallet loads all same-day cards, uses the project cap, and submits in
   instance.workContext = frame;
   instance.resumeStages = true;
   assert.equal(await instance.run(), 'submitted');
-  assert.equal(plan.totalCny, 9900);
+  assert.equal(plan.totalCny, 9700);
   assert.deepEqual(plan.rows.map(({ invoiceNumber }) => invoiceNumber), [tickets[1].invoiceNumber, tickets[2].invoiceNumber]);
   assert.equal(instance.progress.didiWallet.state, 'verified');
   assert.equal(instance.progress.submission.financeFormId, 'FIXTURE-DIDI-001');

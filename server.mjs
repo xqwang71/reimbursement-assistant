@@ -1111,12 +1111,33 @@ function hasArchivedFolders(plan) {
   return plan.sourceFolders.every((folder) => plan.archivedFolders?.includes(`${folder}-已报销`));
 }
 
-function markVerifiedBatchComplete(batch) {
-  if (!batch.currentRunId || !batch.runIds.every((id) => runs.get(id)?.status === 'completed')) return;
-  batch.status = 'completed';
-  batch.currentRunId = null;
+function nextBatchIndexAfterManualReceipt(batch) {
+  if (!['paused', 'preview', 'error', 'verification_required', 'interrupted'].includes(batch.status)) return null;
+  const completed = runs.get(batch.currentRunId);
+  if (!completed || batch.runIds[batch.currentIndex] !== completed.id || completed.status !== 'completed' ||
+      completed.control.progress.submission.state !== 'verified' || completed.control.progress.submission.source !== 'user_verified' ||
+      !completed.bookkeeping?.historyRecorded || claimWithdrawalFor(history, completed.id)) return null;
+  const nextIndex = batch.currentIndex + 1;
+  if (nextIndex >= batch.runIds.length || !batch.runIds.slice(0, nextIndex).every((id) => runs.get(id)?.status === 'completed')) return null;
+  const untouched = batch.runIds.slice(nextIndex).every((id) => {
+    const run = runs.get(id);
+    if (run?.status !== 'stopped' || run.result || run.events?.length || run.control.cancelled || hasUnresolvedEffect(run)) return false;
+    const { progress } = run.control;
+    return !progress.ownedDocument && !progress.uploadPageId && !progress.fillingId && !progress.documentId && !progress.uploads.length;
+  });
+  return untouched ? nextIndex : null;
+}
+
+function updateBatchAfterReceipt(batch, updatedAt = batch.updatedAt) {
+  if (!batch.currentRunId) return;
+  if (batch.runIds.every((id) => runs.get(id)?.status === 'completed')) {
+    batch.status = 'completed';
+    batch.currentRunId = null;
+  } else if (nextBatchIndexAfterManualReceipt(batch) !== null) {
+    batch.status = 'paused';
+  } else return;
   batch.error = null;
-  batch.updatedAt = new Date().toISOString();
+  batch.updatedAt = updatedAt;
 }
 
 function createRun(plan) {
@@ -1440,6 +1461,18 @@ async function executeBatch(batch, startIndex = 0) {
   const failed = batch.runIds.map((id) => runs.get(id)).some((run) => run?.status === 'error');
   batch.status = failed ? 'completed_with_errors' : 'completed';
   batch.updatedAt = new Date().toISOString();
+}
+
+function launchBatch(batch, startIndex, owner) {
+  executeBatch(batch, startIndex).catch((error) => {
+    batch.status = 'error';
+    batch.error = error.message;
+    batch.updatedAt = new Date().toISOString();
+    for (const id of batch.runIds.slice(batch.currentIndex + 1)) {
+      const run = runs.get(id);
+      if (run?.status === 'queued') run.status = 'stopped';
+    }
+  }).finally(() => { releaseBrowser(owner); saveRuns().catch(() => undefined); });
 }
 
 async function checkCampusLogin() {
@@ -2294,11 +2327,7 @@ async function route(request, response) {
       batch.runIds.push(run.id);
     }
     batches.set(batch.id, batch);
-    executeBatch(batch).catch((error) => {
-      batch.status = 'error';
-      batch.error = error.message;
-      batch.updatedAt = new Date().toISOString();
-    }).finally(() => { releaseBrowser(owner); saveRuns().catch(() => undefined); });
+    launchBatch(batch, 0, owner);
     await saveRuns();
     return json(response, 202, { batch: publicBatch(batch) });
   }
@@ -2382,7 +2411,11 @@ async function route(request, response) {
         await recordSubmitted(run);
         run.status = 'completed';
         run.result = 'submitted';
-        for (const batch of batches.values()) if (batch.currentRunId === run.id) markVerifiedBatchComplete(batch);
+        for (const batch of batches.values()) {
+          if (batch.currentRunId !== run.id) continue;
+          updateBatchAfterReceipt(batch, run.updatedAt);
+          if (batch.status === 'paused') addMessage(run, 'assistant', '手动提交已登记。回复「继续」可接续原批次的剩余报销。');
+        }
       } else if (input.resolution === 'not_submitted') {
         run.control.progress.submission = { state: 'not_started' };
         run.control.cancelled = false;
@@ -2459,6 +2492,25 @@ async function route(request, response) {
     addMessage(run, 'user', message);
 
     if (directive && run.status === 'completed') {
+      const batch = wantsResume && [...batches.values()].find((item) => item.currentRunId === run.id);
+      const nextIndex = batch ? nextBatchIndexAfterManualReceipt(batch) : null;
+      if (nextIndex !== null) {
+        const owner = randomUUID();
+        reserveBrowser(owner);
+        const remaining = batch.runIds.slice(nextIndex).map((id) => runs.get(id));
+        try {
+          for (const queued of remaining) await validateRun(queued);
+          if (nextBatchIndexAfterManualReceipt(batch) !== nextIndex) throw new Error('批次已经变化，请刷新后再继续。');
+        } catch (error) {
+          releaseBrowser(owner);
+          throw httpError(409, error.message);
+        }
+        for (const queued of remaining) queued.status = 'queued';
+        addMessage(run, 'assistant', `本笔已登记，正在接续原批次剩余的 ${remaining.length} 笔报销。`);
+        launchBatch(batch, nextIndex, owner);
+        await saveRuns();
+        return json(response, 202, { run: publicRun(run), batch: publicBatch(batch) });
+      }
       addMessage(run, 'assistant', '本笔已收到学校回执并登记。');
       return json(response, 200, { run: publicRun(run) });
     }
@@ -2675,7 +2727,7 @@ for (const run of runs.values()) {
     try { await recordSubmitted(run); } catch (error) { run.status = 'verification_required'; run.error = `已核实提交，本地登记尚未完成：${error.message}`; }
   }
 }
-for (const batch of batches.values()) markVerifiedBatchComplete(batch);
+for (const batch of batches.values()) updateBatchAfterReceipt(batch);
 await saveRuns();
 
 export function handleRequest(request, response) {
