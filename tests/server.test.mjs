@@ -581,7 +581,13 @@ test('a Didi draft can resume after restart and the claim can be removed after t
   assert.equal((await instruction('先别提交')).status, 200);
   await waitForBatch(preview);
   const resolveDraft = (confirmed) => app.request(`${route}/resolution`, { confirmed, resolution: 'abandon_draft' });
-  assert.equal((await resolveDraft(false)).status, 400);
+  const deadline = Date.now() + 2500;
+  let unconfirmed = await resolveDraft(false);
+  while (unconfirmed.status === 409 && unconfirmed.body.error.includes('本任务正在处理') && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    unconfirmed = await resolveDraft(false);
+  }
+  assert.equal(unconfirmed.status, 400, JSON.stringify(unconfirmed.body));
   const resolved = await resolveDraft(true);
   assert.equal(resolved.status, 200);
   assert.equal(resolved.body.run.status, 'abandoned');
