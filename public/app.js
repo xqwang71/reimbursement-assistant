@@ -1,8 +1,9 @@
-import { allocateProjects, matchProjects } from './project-allocation.js';
+import { allocateProjects, matchProjects, projectNumberKey } from './project-allocation.js';
 import { bindModelSettings } from './model-settings.js';
 import { bindFundingSummary } from './funding-summary.js';
 import { bindPayrollForm } from './payroll.js';
 import { bindReviewArchive } from './review-archive.js';
+import { mountSignerPicker } from './signer-picker.js';
 
 const SUBJECTS = ['电脑配件', '办公用品', '书籍资料', 'AI服务', '数据服务', '境外软件订阅', '劳务费', '差旅', '其他'];
 const ROUTE_LABELS = { smart: '智能报销系统', legacy: '日常线下报销', labor: '薪酬申报', split: '混合结算', review: '办理系统待核对' };
@@ -36,11 +37,12 @@ const state = {
   blockingRun: null,
   defaultSourceRoot: '',
   projects: [],
+  projectSigners: {},
   payrollCategories: [],
   payrollPositions: [],
   payrollExpenseItems: [],
   payrollSignerNames: {},
-  signerNames: [],
+  signerRoster: [],
   projectSyncedAt: null,
   activeFolder: '',
   selected: new Set(),
@@ -347,7 +349,9 @@ function rowStatusFor(folder) {
   if (item?.didi) {
     const entry = reasonEntry(folder);
     const needsReason = cleanReason(entry.text) !== entry.confirmed || item.didi.blocker;
-    return needsReason ? { type: 'blocked', text: '待补齐' } : { type: 'ready', text: '可执行' };
+    if (needsReason) return { type: 'blocked', text: '待补齐' };
+    if (item.didi.signer === null) return { type: 'blocked', text: '待指定加签人' };
+    return { type: 'ready', text: '可执行' };
   }
   const plan = state.plans.get(folder);
   if (plan?.status === 'ready' && cleanReason(reasonEntry(folder).text) !== plan.reason) return { type: 'blocked', text: '事由待更新' };
@@ -419,6 +423,7 @@ function checkedPlanStatus(plan) {
   if (plan.reimbursementRoute === 'split') return { type: 'blocked', text: '请按结算方式拆分' };
   if (plan.reimbursementRoute === 'review') return { type: 'blocked', text: '付款材料待核对' };
   if (plan.status !== 'ready') return { type: 'blocked', text: plan.project.projectNo ? '待补充/核对' : '待匹配' };
+  if (plan.reimbursementRoute === 'smart' && plan.signer === null) return { type: 'blocked', text: '待指定加签人' };
   if (plan.warnings?.length) return { type: 'reminder', text: '有提醒，可执行' };
   return { type: 'checked', text: '核对通过' };
 }
@@ -726,6 +731,18 @@ async function lookupForeignQuote(button) {
   }
 }
 
+function defaultSignerLabel({ signerDefault, signerDefaultSource }) {
+  if (signerDefaultSource === 'conflict') return '项目默认加签人不同，请为本笔指定';
+  if (!signerDefault) return '未设置默认加签人';
+  return (signerDefaultSource === 'project' ? '项目默认 · ' : '经费口径备用 · ') + signerDefault.name;
+}
+
+function applySignerRoster(result) {
+  if (Array.isArray(result.signerRoster)) state.signerRoster = result.signerRoster;
+  else if (Array.isArray(result.signerNames)) state.signerRoster = result.signerNames.map((name) => ({ name, employeeNo: '' }));
+}
+
+let detailSignerPicker;
 function renderPlanDetails(plan) {
   const recognized = recognizedPaymentTotal(plan);
   const showRecognized = recognized !== null && (paymentReviewNeeded(plan) || !Number.isSafeInteger(plan.paidTotalCny));
@@ -738,7 +755,8 @@ function renderPlanDetails(plan) {
   const invoiceRows = plan.rows.map((row) => `<tr><td>${escapeHtml(row.invoiceNumber || row.invoiceFile)}${plan.fileSources?.[row.invoiceFile] ? `<small class="source-note">${escapeHtml(plan.fileSources[row.invoiceFile].folder)}</small>` : ''}</td><td>${escapeHtml(row.date || '')}</td><td>${money(row.invoiceAmountCny)}${row.foreignMoney ? `<small class="source-note">${escapeHtml(foreignMoney(row.foreignMoney))}</small>` : ''}</td><td>${money(row.paidAmountCny)}</td><td>${money(row.reimbursementAmountCny)}</td></tr>`).join('');
   const batchRows = plan.batches.map((batch, index) => `<tr><td>第 ${index + 1} 批</td><td>${batch.length}</td><td>${escapeHtml(batch.join('、'))}</td></tr>`).join('');
   const warnings = plan.warnings.length ? `<div class="warnings"><strong>核对提醒</strong><ul>${plan.warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></div>` : '';
-  const executionLabel = offline ? checkedPlanStatus(plan).text : ready ? (warnings ? '有提醒，可以执行' : '核对通过，可以执行') : '尚不能执行';
+  const signerPending = plan.reimbursementRoute === 'smart' && plan.signer === null;
+  const executionLabel = offline ? checkedPlanStatus(plan).text : ready && !signerPending ? (warnings ? '有提醒，可以执行' : '核对通过，可以执行') : '尚不能执行';
   const KIND_LABELS = { invoice: '发票', detail: '订单/明细', payment: '支付记录', receipt: '签收单', asset: '资产卡片', other: '其他正式材料' };
   const fileNames = labor ? plan.supportingFiles : offline ? plan.paperFiles || plan.uploadFiles : plan.uploadFiles;
   const fileHeading = labor ? '来源材料' : offline ? '线下材料' : '全部上传文件';
@@ -752,8 +770,6 @@ function renderPlanDetails(plan) {
   }).join('');
   const expenseTypeOptions = ['<option value="">执行时确认</option>', ...EXPENSE_TYPES.map((type) => `<option value="${type}" ${plan.expenseType === type ? 'selected' : ''}>${type}</option>`)].join('');
   const subjectOptions = SUBJECTS.map((subject) => `<option value="${subject}" ${plan.subject === subject ? 'selected' : ''}>${subject}</option>`).join('');
-  const signerNames = [...new Set([...state.signerNames, plan.signer?.name].filter(Boolean))];
-  const signerOptions = signerNames.map((name) => `<option value="${escapeHtml(name)}" ${plan.signer?.name === name ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('');
   return `<div class="plan">
     <section class="detail-section"><h3>办理系统</h3><p>${routeLabel}</p></section>
     ${labor ? '' : `<div class="metrics"><div class="metric"><small>发票总额</small><strong>${money(plan.invoiceTotalCny)}</strong></div><div class="metric"><small>${showRecognized ? '已识别付款' : '已关联实付'}</small><strong>${money(showRecognized ? recognized : plan.paidTotalCny)}</strong></div><div class="metric"><small>核定报销</small><strong>${money(plan.totalCny)}</strong></div></div>`}
@@ -766,13 +782,11 @@ function renderPlanDetails(plan) {
         ${offline ? `<label>纸质附件张数<input id="editPaperCount" type="number" min="1" max="50" step="1" value="${plan.attachmentCount ?? ''}"></label>` : ''}
       `}
       ${offline ? '' : `<label>费用类型<select id="editExpenseType">${expenseTypeOptions}</select></label>
-        <label>加签人<select id="editSignerName">${signerOptions}<option value="">手动输入姓名</option></select></label>
-        <label id="customSignerEntry" hidden>加签人姓名<input id="customSignerName" type="text" maxlength="80" autocomplete="off"></label>
-        <label>本笔加签人工号（可选）<input id="editSignerCode" type="text" maxlength="30" autocomplete="off" value="${escapeHtml(plan.signer?.employeeNo || '')}"></label>`}
+        <div id="detailSignerPicker" class="signer-picker"></div>`}
     </div>
     <div class="edit-actions"><button id="savePlanEdit" class="secondary" type="button">保存设置</button><span id="editStatus" class="muted"></span></div>
     ${offline ? '' : `<dl><dt>费用类型特例</dt><dd>${plan.expenseTypeRules?.length ? escapeHtml(plan.expenseTypeRules.map((rule) => `${rule.keyword}→${rule.type}`).join('、')) : '无'}</dd><dt>票据</dt><dd>${plan.rows.length} 张发票，${plan.uploadFiles.length} 个上传文件（${reviewSource}），分 ${plan.batches.length} 批</dd><dt>检查状态</dt><dd>${plan.cacheState === 'cached' ? '本机取字结果已缓存' : '已读取新增或更新的附件'}。</dd></dl>`}
-    <div class="${ready ? 'muted' : 'warnings'}"><strong>${executionLabel}</strong>${plan.blockers?.length ? `<ul>${plan.blockers.map((message) => `<li>${escapeHtml(message)}</li>`).join('')}</ul>` : ''}</div>
+    <div class="${ready && !signerPending ? 'muted' : 'warnings'}"><strong>${executionLabel}</strong>${plan.blockers?.length ? `<ul>${plan.blockers.map((message) => `<li>${escapeHtml(message)}</li>`).join('')}</ul>` : ''}</div>
     ${warnings}
     ${renderMaterialReview(plan)}
     ${renderTravelSection(plan)}
@@ -794,6 +808,7 @@ function openDetails(folder) {
 function closeDetails() {
   state.detailFolder = '';
   $('detailModal').hidden = true;
+  detailSignerPicker = null;
 }
 
 async function savePlanEdits() {
@@ -803,15 +818,9 @@ async function savePlanEdits() {
   const config = configFor(folder);
   const subject = $('editSubject').value;
   const expenseType = $('editExpenseType')?.value;
-  const signerPicker = $('editSignerName');
-  const customSigner = $('customSignerName');
-  const signerName = signerPicker?.value || customSigner?.value.normalize('NFKC').trim().replace(/\s+/g, ' ');
-  if (signerPicker && !signerName) {
-    $('editStatus').textContent = '请填写加签人姓名。';
-    customSigner.focus();
-    return;
-  }
-  const payload = { folder, funding: plan.funding, subject };
+  if (detailSignerPicker && !detailSignerPicker.reportValidity()) return;
+  const signer = detailSignerPicker?.value();
+  const payload = { sourceRoot: state.sourceRoot, folder, planId: plan.id, subject };
   if ($('editBookingRoute')) {
     const count = $('editPaperCount');
     if (count && !count.reportValidity()) return;
@@ -822,10 +831,9 @@ async function savePlanEdits() {
     };
   }
   if (expenseType && expenseType !== plan.expenseType) payload.expenseType = expenseType;
-  const signerCode = $('editSignerCode')?.value.trim() || '';
-  if (signerName && (!signerPicker.value || signerName !== plan.signer?.name || signerCode !== (plan.signer?.employeeNo || ''))) {
-    payload.signerName = signerName;
-    if (signerCode || signerName === plan.signer?.name) payload.signerEmployeeNo = signerCode;
+  if (signer !== undefined && (signer?.name !== plan.signerOverride?.name ||
+      (signer?.employeeNo || '') !== (plan.signerOverride?.employeeNo || ''))) {
+    payload.signerOverride = signer;
   }
   if (subject === '差旅' && $('editTravelRole')) {
     payload.travelProfile = { role: $('editTravelRole').value, fundType: $('editTravelFund').value };
@@ -836,7 +844,7 @@ async function savePlanEdits() {
   $('editStatus').textContent = '保存中…';
   try {
     const result = await api('/api/plan-override', { method: 'POST', body: JSON.stringify(payload) });
-    if (result.signerNames) state.signerNames = result.signerNames;
+    applySignerRoster(result);
     config.subject = subject;
     const item = itemFor(folder);
     if (item && payload.bookingOptions && item.offlineBooking !== payload.bookingOptions.offline) {
@@ -873,12 +881,11 @@ function renderDetailModal() {
     : `${plan.rows.length} 张发票 · 核定报销 ${money(plan.totalCny)} · ${plan.cacheState === 'cached' ? '复用缓存' : '重新识别'}`;
   $('detailContent').innerHTML = renderPlanDetails(plan);
   $('savePlanEdit')?.addEventListener('click', savePlanEdits);
-  $('editSignerName')?.addEventListener('change', (event) => {
-    const entry = $('customSignerEntry');
-    $('editSignerCode').value = event.target.value && event.target.value === plan.signer?.name ? plan.signer.employeeNo || '' : '';
-    entry.hidden = Boolean(event.target.value);
-    if (!entry.hidden) $('customSignerName').focus();
-  });
+  const picker = $('detailSignerPicker');
+  detailSignerPicker = picker ? mountSignerPicker(picker, {
+    label: '本笔加签人', roster: state.signerRoster, selected: plan.signerOverride,
+    defaultLabel: `沿用默认（${defaultSignerLabel(plan)}）`,
+  }) : null;
   $('saveMaterials')?.addEventListener('click', saveMaterialReview);
   $('detailModal').hidden = false;
 }
@@ -994,18 +1001,22 @@ function renderProjects() {
   const scroll = list.scrollTop;
   list.innerHTML = projects.map((project) => {
     const current = matched.some((item) => item.projectNo === project.projectNo);
+    const defaultSigner = state.projectSigners[projectNumberKey(project.projectNo)];
     const amountCny = allocations?.find((item) => item.projectNo === project.projectNo)?.amountCny ?? (!matched.length ? state.amounts.get(folder)?.totalCny : null);
     const difference = route === 'smart' && Number.isSafeInteger(amountCny) && Number.isSafeInteger(project.balanceCny)
       ? project.balanceCny - amountCny : null;
     return `<article class="project-match${current ? ' is-matched' : ''}">
-      <div class="project-match-name"><strong>${escapeHtml(project.projectName || project.projectNo)}</strong><small>${escapeHtml(project.projectNo)}</small></div>
+      <div class="project-match-name"><strong>${escapeHtml(project.projectName || project.projectNo)}</strong><small>${escapeHtml(project.projectNo)}</small>${defaultSigner ? `<small>默认加签人 ${escapeHtml(defaultSigner.name)}</small>` : ''}</div>
       <div class="project-money">
         <div class="project-balance">可用金额 <span>${money(project.balanceCny, '待同步')}</span></div>
         <div class="project-labor">其中劳务费 <span>${money(project.laborBalanceCny, '待查询')}</span></div>
         ${Number.isSafeInteger(project.totalCny) ? `<div>项目总额 ${money(project.totalCny)}</div>` : ''}
       </div>
       ${difference !== null && difference < 0 ? `<small class="match-shortage">按已同步余额，差 ${money(-difference)}</small>` : ''}
-      <button class="secondary" type="button" data-match-project="${escapeHtml(project.projectNo)}" aria-pressed="${current}" aria-label="${current ? '移除' : '匹配'} ${escapeHtml(project.projectName || project.projectNo)}" ${!folder || saving ? 'disabled' : ''}>${current ? '移除' : singleProjectClaim(itemFor(folder)) && matched.length ? '改选' : '匹配'}</button>
+      <div class="project-match-actions">
+        <button class="secondary" type="button" data-match-project="${escapeHtml(project.projectNo)}" aria-pressed="${current}" aria-label="${current ? '移除' : '匹配'} ${escapeHtml(project.projectName || project.projectNo)}" ${!folder || saving ? 'disabled' : ''}>${current ? '移除' : singleProjectClaim(itemFor(folder)) && matched.length ? '改选' : '匹配'}</button>
+        <button class="secondary" type="button" data-project-signer="${escapeHtml(project.projectNo)}" aria-label="设置加签人 ${escapeHtml(project.projectName || project.projectNo)}">加签人</button>
+      </div>
     </article>`;
   }).join('') || '<p class="muted">没有符合条件的项目。可以同步学校项目，或手动匹配。</p>';
   list.scrollTop = scroll;
@@ -1017,8 +1028,10 @@ function updateSelectionCount() {
   const ready = selected.filter((folder) => {
     const item = itemFor(folder);
     if (item?.payroll) return !item.payroll.blocker;
-    if (item?.didi) return !item.didi.blocker && cleanReason(reasonEntry(folder).text) === reasonEntry(folder).confirmed;
-    return state.plans.get(folder)?.status === 'ready' && state.plans.get(folder).reason === cleanReason(reasonEntry(folder).text) && !allocationState(folder).dirty;
+    if (item?.didi) return !item.didi.blocker && item.didi.signer !== null && cleanReason(reasonEntry(folder).text) === reasonEntry(folder).confirmed;
+    const plan = state.plans.get(folder);
+    return plan?.status === 'ready' && (plan.reimbursementRoute !== 'smart' || plan.signer !== null) &&
+      plan.reason === cleanReason(reasonEntry(folder).text) && !allocationState(folder).dirty;
   }).length;
   $('selectionCount').textContent = count ? `已选 ${count} 个报销事项 · ${state.blockingRun ? '有一笔原任务待处理' : `${ready} 个可执行`}` : '勾选中间的报销事项后批量执行';
   $('mergeClaims').disabled = selected.filter((folder) => !singleProjectClaim(itemFor(folder))).length < 2;
@@ -1124,7 +1137,7 @@ function renderRows() {
       <div class="folder-figure"><strong class="folder-amount">${amount.value}</strong><small class="folder-amount-label">${amount.label}</small></div>
       <div class="folder-actions">
         <button class="secondary match-row" type="button" aria-label="匹配经费 ${label}" aria-pressed="${current}">匹配经费</button>
-        ${item.didi ? '<button class="secondary" type="button" data-edit-didi>修改预算</button><button class="text-button" type="button" data-remove-didi>移除</button>'
+        ${item.didi ? '<button class="secondary" type="button" data-edit-didi>详情</button><button class="text-button" type="button" data-remove-didi>移除</button>'
           : `<button class="secondary detail-row" type="button" ${plan ? '' : 'disabled'}>${paymentReviewNeeded(plan) ? '核对发票和付款' : '详情'}</button>`}
       </div>
       ${item.didi ? '' : renderClaimSources(item)}
@@ -1327,7 +1340,7 @@ function showExecutionFeedback(message, { blocked = true, folder = '', focusReas
   details.dataset.allocation = String(allocation);
   details.textContent = openRun ? '查看执行进度' : allocation ? '查看分配'
     : paymentReviewNeeded(state.plans.get(folder)) ? '核对发票和付款' : '查看详情';
-  details.hidden = !openRun && !allocation && (!folder || !state.plans.has(folder));
+  details.hidden = !openRun && !allocation && !state.plans.has(folder) && !itemFor(folder)?.didi;
   if (!blocked || !reveal) return;
   feedback.scrollIntoView({ block: 'nearest' });
   if (!focusReason) return;
@@ -1369,6 +1382,11 @@ async function executeSelected() {
     item.didi && cleanReason(reasonEntry(item.path).text) !== reasonEntry(item.path).confirmed);
   if (incomplete) {
     showExecutionFeedback(`${incomplete.label} · ${(incomplete.payroll || incomplete.didi).blocker || '请先保存或更新用车事由'}`, { folder: incomplete.path, focusReason: Boolean(incomplete.didi && incomplete.match) });
+    return;
+  }
+  const unsignedDidi = direct.find((item) => item.didi?.signer === null);
+  if (unsignedDidi) {
+    showExecutionFeedback(`${unsignedDidi.label} · 请在项目设置默认加签人，或在详情填写本笔加签人。`, { folder: unsignedDidi.path });
     return;
   }
   const missing = folders.filter((folder) => !state.plans.has(folder));
@@ -1419,6 +1437,13 @@ async function executeSelected() {
     return;
   }
   const plans = folders.map((folder) => state.plans.get(folder));
+  const unsigned = plans.find((plan) => plan.reimbursementRoute === 'smart' && plan.signer === null);
+  if (unsigned) {
+    const message = unsigned.signerDefaultSource === 'conflict' ? '所选经费项目的默认加签人不同，请在详情指定本笔加签人。'
+      : '请在项目设置默认加签人，或在详情填写本笔加签人。';
+    showExecutionFeedback(`${displayNameFor(unsigned.folder)} · ${message}`, { folder: unsigned.folder });
+    return;
+  }
   const reminderLines = plans.flatMap((plan) => (plan.warnings || []).map((warning) => `${plan.displayName || displayNameFor(plan.folder)} · ${warning}`));
   const reminderText = reminderLines.length ? `\n本批核对提醒\n${reminderLines.join('\n')}` : '';
   const reminderFolder = plans.find((plan) => plan.warnings?.length)?.folder;
@@ -1648,7 +1673,7 @@ async function refreshFolders(options) {
   state.payrollPositions = result.payrollPositions || [];
   state.payrollExpenseItems = result.payrollExpenseItems || [];
   state.payrollSignerNames = result.payrollSignerNames || {};
-  state.signerNames = result.signerNames || [];
+  applySignerRoster(result);
   renderSchoolFinanceEntry();
   state.folders = (result.claims || []).sort((a, b) => (a.label || a.path).localeCompare(b.label || b.path, 'zh-CN'));
   state.selectedSources = new Set([...state.selectedSources].filter((path) => state.sourceFolders.some((item) => item.path === path && !item.reimbursed && !item.claimKey)));
@@ -1754,6 +1779,7 @@ async function loadProjects() {
   try {
     const result = await api('/api/projects');
     state.projects = result.projects || [];
+    state.projectSigners = result.projectSigners || {};
     state.projectSyncedAt = result.syncedAt || null;
     updateProjectStatus(savedProjectStatus());
   } catch (error) {
@@ -1767,6 +1793,7 @@ async function syncProjects() {
   try {
     const result = await api('/api/projects/sync', { method: 'POST' });
     state.projects = result.projects || [];
+    state.projectSigners = result.projectSigners || {};
     state.projectSyncedAt = result.syncedAt || new Date().toISOString();
     updateProjectStatus(savedProjectStatus());
     renderRows();
@@ -1783,7 +1810,7 @@ function toggleSelectAll() {
   const pending = state.folders.filter((item) => !item.reimbursed);
   const visible = visiblePendingClaims(pending).filter((item) => {
     if (item.payroll) return !item.payroll.blocker && item.match?.projectNo;
-    if (item.didi) return !item.didi.blocker && cleanReason(reasonEntry(item.path).text) === reasonEntry(item.path).confirmed;
+    if (item.didi) return !item.didi.blocker && item.didi.signer !== null && cleanReason(reasonEntry(item.path).text) === reasonEntry(item.path).confirmed;
     return canSelectForExecution(item.path) && projectForFolder(item.path);
   }).map((item) => item.path);
   const allSelected = visible.length && visible.every((folder) => state.selected.has(folder));
@@ -1794,18 +1821,25 @@ function toggleSelectAll() {
   renderRows();
 }
 
+let teachingSignerPicker;
+let researchSignerPicker;
 function renderBasicSettings(result) {
   state.workspace = result.workspace ?? null;
   selectConfigStorage(state.workspace);
   state.defaultSourceRoot = result.defaultSourceRoot;
   $('sourceRoot').value = result.sourceRoot;
   $('sourceRoot').readOnly = Boolean(state.workspace);
+  applySignerRoster(result);
+  teachingSignerPicker = mountSignerPicker($('teachingSignerPicker'), {
+    label: '教学备用加签人', roster: state.signerRoster,
+    selected: result.preferences?.signers?.['教学'], defaultLabel: '不设置备用加签人',
+  });
+  researchSignerPicker = mountSignerPicker($('researchSignerPicker'), {
+    label: '科研备用加签人', roster: state.signerRoster,
+    selected: result.preferences?.signers?.['科研'], defaultLabel: '不设置备用加签人',
+  });
   if (result.preferences) {
-    const { signers, campus, autoPrint, smartPaymentLabel, legacyPaymentLabel, researchProjectNos } = result.preferences;
-    $('teachingSigner').value = signers['教学']?.name || '';
-    $('teachingSignerCode').value = signers['教学']?.employeeNo || '';
-    $('researchSigner').value = signers['科研']?.name || '';
-    $('researchSignerCode').value = signers['科研']?.employeeNo || '';
+    const { campus, autoPrint, smartPaymentLabel, legacyPaymentLabel, researchProjectNos } = result.preferences;
     $('bookingCampus').value = campus;
     $('autoPrint').checked = autoPrint;
     $('smartPaymentLabel').value = smartPaymentLabel;
@@ -1914,14 +1948,15 @@ async function saveRoot(demoMode = false) {
     status.textContent = '请填写票据根目录。';
     return;
   }
+  if (!teachingSignerPicker.reportValidity() || !researchSignerPicker.reportValidity()) return;
   $('saveRoot').disabled = true;
   status.textContent = '正在保存基本信息…';
   try {
     await Promise.all([...reasonEntries.values()].filter((entry) => entry.sourceRoot === state.sourceRoot && cleanReason(entry.text) !== entry.saved).map((entry) => saveReasonDraft(entry)));
     const preferences = {
       signers: {
-        教学: { name: $('teachingSigner').value, employeeNo: $('teachingSignerCode').value },
-        科研: { name: $('researchSigner').value, employeeNo: $('researchSignerCode').value },
+        教学: teachingSignerPicker.value(),
+        科研: researchSignerPicker.value(),
       },
       campus: $('bookingCampus').value, autoPrint: $('autoPrint').checked,
       smartPaymentLabel: $('smartPaymentLabel').value, legacyPaymentLabel: $('legacyPaymentLabel').value,
@@ -2060,6 +2095,7 @@ const setReviewArchiveAvailable = bindReviewArchive(api);
 async function refreshSavedClaim(folder, message, focus = true) {
   const saved = await api('/api/folders');
   if (saved.sourceRoot !== state.sourceRoot) return;
+  applySignerRoster(saved);
   const item = saved.claims?.find((entry) => entry.path === folder);
   if (!item) return;
   state.folders = [...state.folders.filter((entry) => entry.path !== folder), item]
@@ -2081,18 +2117,65 @@ const openPayroll = bindPayrollForm({
   api, $, money,
   getContext: () => ({
     sourceRoot: state.sourceRoot, categories: state.payrollCategories, positions: state.payrollPositions,
-    expenseItems: state.payrollExpenseItems, signerNames: state.payrollSignerNames,
+    expenseItems: state.payrollExpenseItems, signerNames: state.payrollSignerNames, signerRoster: state.signerRoster,
   }),
   async onSave(result) {
     await refreshSavedClaim(result.key, '薪酬申报已保存，请在右栏匹配经费。');
   },
 });
 $('addPayroll').addEventListener('click', () => openPayroll().catch((error) => setWorklistStatus(error.message)));
+let projectSignerPicker;
+function openProjectSigner(project) {
+  const dialog = $('projectSignerDialog');
+  const signer = state.projectSigners[projectNumberKey(project.projectNo)];
+  $('projectSignerForm').dataset.projectNo = project.projectNo;
+  $('projectSignerForm').dataset.sourceRoot = state.sourceRoot;
+  $('projectSignerProject').textContent = [project.projectNo, project.projectName].filter(Boolean).join(' · ');
+  projectSignerPicker = mountSignerPicker($('projectSignerPicker'), {
+    label: '项目默认加签人', roster: state.signerRoster, selected: signer,
+    defaultLabel: '不设置项目默认加签人',
+  });
+  $('projectSignerStatus').textContent = '';
+  dialog.showModal();
+}
+
+$('closeProjectSigner').addEventListener('click', () => $('projectSignerDialog').close());
+$('projectSignerForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const { sourceRoot, projectNo } = event.currentTarget.dataset;
+  const status = $('projectSignerStatus');
+  const button = $('saveProjectSigner');
+  if (button.disabled) return;
+  button.disabled = true;
+  status.textContent = '正在保存…';
+  try {
+    const result = await api('/api/project-signer', { method: 'POST', body: JSON.stringify({
+      sourceRoot, projectNo, signer: projectSignerPicker.value(),
+    }) });
+    $('projectSignerDialog').close();
+    if (sourceRoot !== state.sourceRoot) return;
+    state.projectSigners = result.projectSigners;
+    applySignerRoster(result);
+    renderProjects();
+    await refreshFolders();
+    await autoCheckAll();
+  } catch (error) {
+    if ($('projectSignerDialog').open) status.textContent = error.message;
+    else setWorklistStatus(`默认加签人已保存。刷新清单失败，${error.message}`);
+  } finally { button.disabled = false; }
+});
+
 let editingDidi = null;
+let didiSignerPicker;
 function openDidi(item = null) {
   editingDidi = item;
-  $('didiTitle').textContent = item ? '修改贸大出行预算' : '新增贸大出行';
+  $('didiTitle').textContent = item ? '贸大出行详情' : '新增贸大出行';
+  $('saveDidi').textContent = item ? '保存详情' : '保存预算';
   $('didiBudget').value = item ? (item.didi.budgetCny / 100).toFixed(2) : '';
+  didiSignerPicker = mountSignerPicker($('didiSignerPicker'), {
+    label: '本笔加签人', roster: state.signerRoster, selected: item?.didi.signerOverride,
+    defaultLabel: item?.match ? `沿用默认（${defaultSignerLabel(item.didi)}）` : '沿用默认（匹配项目后带出）',
+  });
   $('didiStatus').textContent = '';
   $('didiDialog').showModal();
 }
@@ -2110,10 +2193,12 @@ $('didiForm').addEventListener('submit', async (event) => {
   try {
     const { key } = await api(item ? '/api/didi-claims/' + item.groupId : '/api/didi-claims', {
       method: item ? 'PUT' : 'POST',
-      body: JSON.stringify({ sourceRoot, budget: $('didiBudget').value }),
+      body: JSON.stringify({ sourceRoot, budget: $('didiBudget').value, revision: item?.didi.revision,
+        signerOverride: didiSignerPicker.value(),
+      }),
     });
     $('didiDialog').close();
-    if (sourceRoot === state.sourceRoot) await refreshSavedClaim(key, item ? '预算已更新。' : '预算已保存，请填写用车事由并在右栏匹配经费。');
+    if (sourceRoot === state.sourceRoot) await refreshSavedClaim(key, item ? '贸大出行详情已更新。' : '预算已保存，请填写用车事由并在右栏匹配经费。');
   } catch (error) {
     if ($('didiDialog').open) $('didiStatus').textContent = error.message;
     else setWorklistStatus(error.message);
@@ -2206,7 +2291,8 @@ $('executionDetails').addEventListener('click', (event) => {
     const form = folderRow(folder)?.querySelector('.allocation-form');
     form?.scrollIntoView({ block: 'nearest' });
     form?.querySelector('.allocation-input')?.focus({ preventScroll: true });
-  } else openDetails(folder);
+  } else if (itemFor(folder)?.didi) openDidi(itemFor(folder));
+  else openDetails(folder);
 });
 $('folderFilter').addEventListener('input', renderRows);
 $('claimRouteFilter').addEventListener('change', () => {
@@ -2334,9 +2420,13 @@ $('matchTarget').addEventListener('click', (event) => {
   saveProjectMatch(state.activeFolder, null);
 });
 $('projectRows').addEventListener('click', (event) => {
-  const button = event.target.closest('[data-match-project]');
-  const project = [...state.projects, ...projectsForFolder(state.activeFolder)].find((item) => item.projectNo === button?.dataset.matchProject);
-  if (project) matchProject(project, button.getAttribute('aria-pressed') === 'true');
+  const button = event.target.closest('[data-match-project], [data-project-signer]');
+  if (!button) return;
+  const projectNo = button.dataset.matchProject ?? button.dataset.projectSigner;
+  const project = [...state.projects, ...projectsForFolder(state.activeFolder)].find((item) => item.projectNo === projectNo);
+  if (!project) return;
+  if (button.hasAttribute('data-project-signer')) openProjectSigner(project);
+  else matchProject(project, button.getAttribute('aria-pressed') === 'true');
 });
 $('matchFunding').addEventListener('change', (event) => {
   const folder = state.activeFolder;

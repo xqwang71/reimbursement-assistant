@@ -14,7 +14,7 @@ import { didiBudgetCny, validateDidiSelection } from './lib/didi-invoices.mjs';
 import { normalizeModelSettings, publicModelSettings, readModelSettings } from './lib/model-settings.mjs';
 import { documentNumber, fundingSummaryCsv, readFundingExports, readPayrollPeople, summarizeFunding } from './lib/funding-summary.mjs';
 import { DEFAULT_PORT, isInsideDirectory, privateDataDirectory, profileId, receiptDirectory, serviceRevision } from './lib/platform.mjs';
-import { DEFAULT_PREFERENCES, localPreferences, localSigner, projectFunding } from './lib/local-settings.mjs';
+import { DEFAULT_PREFERENCES, localPreferences, localSigner, projectFunding, resolveClaimSigner, uniqueSigners } from './lib/local-settings.mjs';
 import { createSchoolFundingSync } from './lib/school-funding-sync.mjs';
 import { checkSchoolFinancePage } from './lib/school-finance-access.mjs';
 import { listWebProjects } from './lib/projects.mjs';
@@ -22,7 +22,7 @@ import { browserPageForTarget, browserTargetId, getBrowserSession, savePlatformS
 import { CAMPUS_LOGIN_REQUIRED } from './lib/portal-navigation.mjs';
 import { loadMemory, saveMemory, learnExpenseType, applyLearning, rememberPlanEdit, EXPENSE_TYPES } from './lib/memory.mjs';
 import { DEFAULT_TRAVEL_PROFILE } from './lib/travel.mjs';
-import { matchProjects, planProjects } from './public/project-allocation.js';
+import { matchProjects, planProjects, projectNumberKey } from './public/project-allocation.js';
 import { captureBocQuote, readBocQuote } from './lib/boc-rates.mjs';
 import { PAYROLL_CATEGORIES, PAYROLL_EXPENSE_ITEMS, PAYROLL_POSITIONS, payrollSignerNames, payrollApproval, payrollIntake } from './lib/payroll-intake.mjs';
 import { executeDailySchoolBooking, preparePayrollHeader } from './lib/school-finance-runner.mjs';
@@ -53,6 +53,8 @@ const RUNS_FILE = join(RUNTIME_DIR, 'runs.json');
 const BATCHES_FILE = join(RUNTIME_DIR, 'batches.json');
 const HISTORY_FILE = join(RUNTIME_DIR, 'history.json');
 const PROJECTS_FILE = join(RUNTIME_DIR, 'projects.json');
+const PROJECT_SIGNERS_FILE = join(RUNTIME_DIR, 'project-signers.json');
+const SIGNER_ROSTER_FILE = join(RUNTIME_DIR, 'signer-roster.json');
 const PROJECT_MATCHES_FILE = join(RUNTIME_DIR, 'project-matches.json');
 const CLAIM_REASONS_FILE = join(RUNTIME_DIR, 'claim-reasons.json');
 const CLAIM_GROUPS_FILE = join(RUNTIME_DIR, 'claim-groups.json');
@@ -85,6 +87,7 @@ const resolvingRuns = new Set();
 const planOperations = new Map();
 let history = { submittedInvoiceNumbers: [], submittedPaymentKeys: [], withdrawals: [] };
 let projectCatalog = { projects: [], syncedAt: null };
+let projectSignerDefaults = {};
 let projectMatches = new Map();
 let fundingAttributions = new Map();
 let fundingWithdrawals = new Map();
@@ -105,6 +108,8 @@ try {
 try {
   projectCatalog = { ...projectCatalog, ...JSON.parse(await readFile(PROJECTS_FILE, 'utf8')) };
 } catch {}
+try { projectSignerDefaults = JSON.parse(await readFile(PROJECT_SIGNERS_FILE, 'utf8')); }
+catch (error) { if (error.code !== 'ENOENT') throw error; }
 try {
   const saved = JSON.parse(await readFile(PROJECT_MATCHES_FILE, 'utf8'));
   projectMatches = new Map(await Promise.all(saved.map(async ([key, value]) => {
@@ -206,6 +211,25 @@ try {
     batches.set(batch.id, batch);
   }
 } catch {}
+
+let savedSignerRoster = await readFile(SIGNER_ROSTER_FILE, 'utf8').then(JSON.parse, (error) => {
+  if (error.code === 'ENOENT') return [];
+  throw error;
+});
+if (!Array.isArray(savedSignerRoster)) throw new Error('本机加签人名单格式有误。');
+let signerRoster = uniqueSigners([
+  ...savedSignerRoster,
+  ...Object.values(preferences.signers),
+  ...Object.values(projectSignerDefaults),
+  ...Object.values(memory.signerByClaim).map((record) => record?.signer),
+  ...Object.values(memory.signerByFunding || {}),
+  ...[...claimGroups.values()].flatMap((group) => [group.didi?.signerOverride, group.payroll?.signerOverride]),
+  ...[...plans.values()].map((plan) => plan.signerOverride),
+  ...[...runs.values()].map((run) => run.plan?.signer),
+]);
+const structuredSignerNames = new Set(signerRoster.map(({ name }) => name));
+signerRoster.push(...uniqueSigners(memory.signerNames.map((name) => ({ name })))
+  .filter(({ name }) => !structuredSignerNames.has(name)));
 
 function atomicJson(file, value) {
   const content = JSON.stringify(value, null, 2);
@@ -609,7 +633,8 @@ async function validateCurrentPlan(plan) {
         group.reason?.draft !== plan.reason || group.reason?.projectNo !== plan.project?.projectNo) {
       throw httpError(409, '贸大出行的预算、经费项目或事由已变化，请重新选择事项');
     }
-    if (!plan.signer?.name) throw httpError(409, '请在设置中填写本笔经费口径的常用加签人。');
+    if (!isDeepStrictEqual(didiSignerSettings(group).signer, plan.signer)) throw httpError(409, '加签人已变化，请重新选择事项。');
+    if (!plan.signer?.name) throw httpError(409, '请在经费项目设置默认加签人，或在贸大出行详情填写本笔加签人。');
     validateDidiSelection(plan, history.submittedInvoiceNumbers);
     return;
   }
@@ -617,14 +642,16 @@ async function validateCurrentPlan(plan) {
     throw httpError(409, '所选票据已有学校预约回执');
   }
   validatePlanContext(plan);
-  if (plan.reimbursementRoute === 'smart' && !plan.signer?.name) throw httpError(409, '请在检查详情或设置中填写加签人。');
   await validatePlanForExecution({
     plan,
     sourceRoot: plan.sourceRoot,
     historyInvoiceNumbers: history.submittedInvoiceNumbers,
     historyPaymentKeys: history.submittedPaymentKeys,
   });
+  await worklistWrites;
   validatePlanContext(plan);
+  const missingSigner = planSignerBlocker(plan);
+  if (missingSigner) throw httpError(409, missingSigner);
   if (!purposeForCurrentDraft(plan)) throw httpError(409, '报销事由已修改，请在清单点击“更新事由”后执行');
   const current = [...plans.values()].findLast((item) => item.sourceRoot === plan.sourceRoot && item.folder === plan.folder);
   if (current?.status !== 'ready' || !isDeepStrictEqual(current.purpose, plan.purpose) ||
@@ -637,9 +664,9 @@ async function validateCurrentPlan(plan) {
 
 function payrollBlocker(group) {
   if (!group.match?.projectNo || !group.match.projectName) return '请在右栏匹配薪酬申报的经费项目。';
-  const approval = approvalFor(group.payroll);
+  const approval = approvalFor(group);
   if (!approval) return '请核对发放类型。';
-  if (!approval.signer) return '请为本笔薪酬申报填写加签人，或在设置中配置常用加签人。';
+  if (!approval.signer) return '请在经费项目设置默认加签人，或在薪酬申报详情填写本笔加签人。';
   const { people, totalCny, reason } = group.payroll;
   if (!normalizeClaimReason(reason)) return '请填写薪酬发放内容。';
   if (!Array.isArray(people) || !people.length || people.some((person) =>
@@ -652,8 +679,11 @@ function payrollBlocker(group) {
   return '';
 }
 
-function approvalFor(payroll) {
-  return payrollApproval(payroll.grantType, preferences.signers, payroll.signerOverride);
+function approvalFor(group) {
+  const { grantType, signerOverride } = group.payroll;
+  const approval = payrollApproval(grantType, preferences.signers);
+  if (!approval) return null;
+  return { funding: approval.funding, ...claimSignerSettings(matchProjects(group.match), approval.signer, signerOverride) };
 }
 
 function payrollPlan(group, preview = false) {
@@ -661,7 +691,7 @@ function payrollPlan(group, preview = false) {
     version: PLAN_VERSION, folder: group.key, groupId: group.id, displayName: group.name, sourceRoot: group.sourceRoot, configurationRevision,
     subject: '劳务费', reimbursementRoute: 'labor', payrollRevision: group.revision, fingerprint: group.revision, payrollPreview: preview,
     project: catalogProject(group.match), reason: group.payroll.reason, peopleCount: group.payroll.people.length,
-    ...approvalFor(group.payroll),
+    ...approvalFor(group),
     totalCny: group.payroll.totalCny, rows: [], paymentKeys: [], uploadFiles: [], batches: [],
   };
 }
@@ -672,6 +702,10 @@ function didiBlocker(group) {
   return '';
 }
 
+function didiSignerSettings(group) {
+  return claimSignerSettings(matchProjects(group.match), preferences.signers[group.match?.funding || '教学'], group.didi.signerOverride);
+}
+
 function didiPlan(group) {
   const { key, id, sourceRoot, didi, reason, match } = group;
   const funding = match?.funding || '教学';
@@ -679,7 +713,7 @@ function didiPlan(group) {
     version: PLAN_VERSION, folder: key, groupId: id, displayName: reason?.draft || group.name, sourceRoot, sourceFolders: [], configurationRevision,
     subject: group.subject, reimbursementRoute: 'smart', didi: { budgetCny: didi.budgetCny },
     fingerprint: createHash('sha256').update(JSON.stringify([key, didi.budgetCny, match, reason?.draft])).digest('hex'),
-    project: catalogProject(match), funding, reason: reason?.draft || '', signer: preferences.signers[funding],
+    project: catalogProject(match), funding, reason: reason?.draft || '', ...didiSignerSettings(group),
     claimType: '贸大出行', expenseType: '市内差旅费', paymentType: preferences.smartPaymentLabel,
     totalCny: null, rows: [], paymentKeys: [], uploadFiles: [], batches: [],
   };
@@ -693,7 +727,7 @@ function validatePayrollPlan(plan) {
   }
   const blocker = payrollBlocker(group);
   if (blocker) throw httpError(409, blocker);
-  if (!isDeepStrictEqual(approvalFor(group.payroll).signer, plan.signer)) throw httpError(409, '加签人已变化，请重新选择事项。');
+  if (!isDeepStrictEqual(approvalFor(group).signer, plan.signer)) throw httpError(409, '加签人已变化，请重新选择事项。');
 }
 
 function checkBatchOverlap(selectedPlans) {
@@ -717,8 +751,7 @@ function storeCurrentPlan(plan, sourceRoot, revision) {
   for (const existing of plans.values()) {
     if (existing.folder !== plan.folder || existing.sourceRoot !== sourceRoot) continue;
     if (existing.signerOverride &&
-        existing.fingerprint === plan.fingerprint && existing.project.projectNo === plan.project.projectNo && existing.funding === plan.funding) {
-      plan.signer = existing.signerOverride;
+        existing.fingerprint === plan.fingerprint && existing.project?.projectNo === plan.project?.projectNo && existing.funding === plan.funding) {
       plan.signerOverride = existing.signerOverride;
     }
     plans.delete(existing.id);
@@ -884,15 +917,52 @@ function withdrawReimbursement(run) {
   });
 }
 
+function projectSigners() {
+  return demoMode ? {} : projectSignerDefaults;
+}
+
+function availableSignerNames() {
+  return [...new Set([...memory.signerNames, ...signerRoster.map(({ name }) => name)])];
+}
+
+async function rememberSigners(...signers) {
+  const updated = uniqueSigners([...signerRoster, ...signers]);
+  if (isDeepStrictEqual(updated, savedSignerRoster)) return;
+  await atomicJson(SIGNER_ROSTER_FILE, updated);
+  savedSignerRoster = signerRoster = updated;
+}
+
+function claimSignerSettings(projects, fallback, override) {
+  return resolveClaimSigner(projects, projectSigners(), fallback, override);
+}
+
+function selectedPlanProjects(plan) {
+  return plan.projectAllocationDraft ?? matchProjects(plan.project);
+}
+
+function applyPlanSigner(plan) {
+  if (plan.reimbursementRoute === 'labor') return;
+  const key = projectMatchKey(plan.sourceRoot, plan.folder);
+  const saved = memory.signerByClaim[key];
+  let override = plan.signerOverride ?? null;
+  if (saved) {
+    const applies = !saved.fingerprint || (saved.fingerprint === plan.fingerprint &&
+      saved.projectNo === plan.project?.projectNo && saved.funding === plan.funding);
+    override = applies ? saved.signer : null;
+  }
+  Object.assign(plan, claimSignerSettings(selectedPlanProjects(plan), preferences.signers[plan.funding], override));
+}
+
+function planSignerBlocker(plan) {
+  if (plan.reimbursementRoute !== 'smart' || plan.signer?.name) return '';
+  return plan.signerDefaultSource === 'conflict' ? '所选经费项目的默认加签人不同，请在检查详情指定本笔加签人。'
+    : '请在经费项目设置默认加签人，或在检查详情填写本笔加签人。';
+}
+
 function applyMemoryToPlan(plan) {
   if (memory.expenseTypeBySubject[plan.subject]) plan.expenseType = memory.expenseTypeBySubject[plan.subject];
   plan.expenseTypeRules = memory.expenseTypeRules || [];
-  const saved = memory.signerByClaim[projectMatchKey(plan.sourceRoot, plan.folder)];
-  if (saved?.signer?.name && saved.fingerprint === plan.fingerprint &&
-      saved.projectNo === plan.project?.projectNo && saved.funding === plan.funding) {
-    plan.signer = { ...saved.signer };
-    plan.signerOverride = plan.signer;
-  }
+  applyPlanSigner(plan);
 }
 
 async function applyMemoryToPlans() {
@@ -907,7 +977,7 @@ function json(response, status, value) {
 
 async function publicConfig() {
   return { demoMode, sourceRoot: liveSourceRoot, defaultSourceRoot: workspace?.sourceRoot ?? DEFAULT_SOURCE_ROOT, workspace: publicWorkspace(workspace),
-    paymentCardConfigured: Boolean(paymentCardLast4), preferences,
+    paymentCardConfigured: Boolean(paymentCardLast4), preferences, signerRoster: demoMode ? [] : signerRoster,
     reviewArchiveAvailable: !demoMode && await hasReviewArchive(REVIEW_ARCHIVE_FILE).catch(() => false) };
 }
 
@@ -1514,6 +1584,7 @@ async function route(request, response) {
       catch (error) { throw httpError(400, error.message); }
       const changed = nextRoot !== SOURCE_ROOT || nextDemo !== demoMode || nextCard !== paymentCardLast4 || !isDeepStrictEqual(nextPreferences, preferences);
       const nextRevision = changed ? randomUUID() : configurationRevision;
+      await rememberSigners(...Object.values(nextPreferences.signers));
       await atomicJson(CONFIG_FILE, { demoMode: nextDemo, sourceRoot: nextDemo ? '' : nextRoot,
         liveSourceRoot: nextDemo ? liveSourceRoot : nextRoot, preferences: nextPreferences,
         paymentCardLast4: nextCard, configurationRevision: nextRevision });
@@ -1538,7 +1609,7 @@ async function route(request, response) {
     return json(response, 200, archive);
   }
   if (request.method === 'GET' && url.pathname === '/api/folders') {
-    if (demoMode) return json(response, 200, { sourceRoot: SOURCE_ROOT, folders: [], claims: [], signerNames: [], payrollCategories: [], payrollPositions: [], payrollExpenseItems: [], payrollSignerNames: {} });
+    if (demoMode) return json(response, 200, { sourceRoot: SOURCE_ROOT, folders: [], claims: [], signerNames: [], signerRoster: [], payrollCategories: [], payrollPositions: [], payrollExpenseItems: [], payrollSignerNames: {} });
     const sourceRoot = SOURCE_ROOT;
     const appointments = schoolBookingsFor(sourceRoot);
     const bySource = new Map(appointments.flatMap((run) => reimbursementSourceFolders(run.plan).map((folder) => [folder, run])));
@@ -1571,12 +1642,15 @@ async function route(request, response) {
         submission,
         withdrawalRunId: group.status === 'submitted' && isRecordedReimbursement(receiptRun) ? receiptRun.id : undefined,
         archivedFolders: group.archivedFolders,
-        ...(group.didi ? { didi: { budgetCny: group.didi.budgetCny, revision: group.revision, blocker: group.status === 'draft' ? didiBlocker(group) : '' } } : {}),
+        ...(group.didi ? { didi: {
+          budgetCny: group.didi.budgetCny, revision: group.revision, ...didiSignerSettings(group),
+          blocker: group.status === 'draft' ? didiBlocker(group) : '',
+        } } : {}),
         ...(group.payroll ? { payroll: {
           category: group.payroll.category,
           peopleCount: group.payroll.people.length,
           totalCny: group.payroll.totalCny,
-          signerName: approvalFor(group.payroll)?.signer?.name || '',
+          signerName: approvalFor(group)?.signer?.name || '',
           revision: group.revision,
           blocker: group.status === 'draft' ? payrollBlocker(group) : '',
         } } : {}),
@@ -1588,7 +1662,7 @@ async function route(request, response) {
         ? { ...folder, label: planLabel(booked.plan), submission: appointmentSummary(booked), withdrawalRunId: booked.id }
         : { ...folder, withdrawalRunId: reimbursements.get(folder.path)?.id };
     }));
-    return json(response, 200, { sourceRoot, claims, signerNames: [...new Set([...memory.signerNames, ...Object.values(preferences.signers).filter(Boolean).map(({ name }) => name)])], payrollCategories: PAYROLL_CATEGORIES, payrollPositions: PAYROLL_POSITIONS, payrollExpenseItems: PAYROLL_EXPENSE_ITEMS, payrollSignerNames: payrollSignerNames(preferences.signers), folders: folders.map((folder) => {
+    return json(response, 200, { sourceRoot, claims, signerNames: availableSignerNames(), signerRoster, payrollCategories: PAYROLL_CATEGORIES, payrollPositions: PAYROLL_POSITIONS, payrollExpenseItems: PAYROLL_EXPENSE_ITEMS, payrollSignerNames: payrollSignerNames(preferences.signers), folders: folders.map((folder) => {
       if (folder.reimbursed) return folder;
       const key = projectMatchKey(sourceRoot, folder.path);
       const reason = claimReasons.get(key);
@@ -1654,7 +1728,8 @@ async function route(request, response) {
     return withWorklistWrite(async () => {
       if (input.sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据根目录已变化，请刷新');
       const existing = id && claimGroupFor(SOURCE_ROOT, `@事项/${id}`);
-      if (id && (!existing?.didi || existing.status !== 'draft' || folderHasOpenRun(SOURCE_ROOT, existing.key))) {
+      if (id && (!existing?.didi || existing.status !== 'draft' || folderHasOpenRun(SOURCE_ROOT, existing.key) ||
+          (input.revision !== undefined && input.revision !== existing.revision))) {
         throw httpError(409, '本笔贸大出行已变化、正在执行或等待核实');
       }
       if (request.method === 'DELETE') {
@@ -1663,13 +1738,18 @@ async function route(request, response) {
       }
       const budgetCny = didiBudgetCny(input.budget);
       if (!budgetCny) throw httpError(400, '请填写大于零的预算上限，最多两位小数');
+      let signerOverride = existing?.didi.signerOverride ?? null;
+      try {
+        if (Object.hasOwn(input, 'signerOverride')) signerOverride = localSigner(input.signerOverride);
+      } catch (error) { throw httpError(400, error.message); }
       const groupId = id || randomUUID();
       const key = `@事项/${groupId}`;
       const group = existing || {
         id: groupId, key, sourceRoot: SOURCE_ROOT, folders: [], name: '贸大出行', subject: '贸大出行',
         match: null, status: 'draft', fileCount: 0, createdAt: new Date().toISOString(),
       };
-      await saveGroup({ ...group, didi: { budgetCny }, revision: randomUUID() });
+      await rememberSigners(signerOverride);
+      await saveGroup({ ...group, didi: { budgetCny, signerOverride }, revision: randomUUID() });
       return json(response, id ? 200 : 201, { id: groupId, key });
     });
   }
@@ -1678,7 +1758,7 @@ async function route(request, response) {
     const [, id, prepare] = payrollMatch;
     const existing = id && claimGroupFor(SOURCE_ROOT, `@事项/${id}`);
     if (id && !existing?.payroll) throw httpError(404, '薪酬申报事项不存在');
-    const approval = existing?.payroll && approvalFor(existing.payroll);
+    const approval = existing?.payroll && approvalFor(existing);
     if (request.method === 'GET' && id && !prepare) return json(response, 200, { revision: existing.revision, project: existing.match, ...existing.payroll, ...approval });
     if (prepare ? request.method !== 'POST' : (request.method !== 'POST' || id) && (request.method !== 'PUT' || !id)) {
       throw httpError(405, '请从薪酬申报清单办理');
@@ -1724,6 +1804,7 @@ async function route(request, response) {
         status: 'draft', fileCount: 0, payroll, revision: randomUUID(),
         createdAt: existing?.createdAt || new Date().toISOString(),
       };
+      await rememberSigners(payroll.signerOverride);
       await saveGroup(group);
       return json(response, id ? 200 : 201, { id: groupId, key });
     });
@@ -1825,7 +1906,37 @@ async function route(request, response) {
     return json(response, 200, { match: await saveProjectMatch(sourceRoot, folder, input.match, input.importOnly === true) });
   }
   if (request.method === 'GET' && url.pathname === '/api/projects') {
-    return json(response, 200, demoMode ? { projects: [], syncedAt: null } : projectCatalog);
+    const catalog = demoMode ? { projects: [], syncedAt: null } : projectCatalog;
+    return json(response, 200, { ...catalog, projectSigners: projectSigners() });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/project-signer') {
+    const input = await body(request);
+    const { sourceRoot, projectNo } = input;
+    if (typeof projectNo !== 'string' || !projectNo.trim() || projectNo.length > 100 || /\p{Cc}/u.test(projectNo)) {
+      throw httpError(400, '请填写有效的项目编号');
+    }
+    if (!Object.hasOwn(input, 'signer')) throw httpError(400, '请在经费项目中填写或清除默认加签人');
+    let signer;
+    try { signer = localSigner(input.signer); }
+    catch (error) { throw httpError(400, error.message); }
+    const key = projectNumberKey(projectNo);
+    const usesProject = (plan) => selectedPlanProjects(plan).some((project) => projectNumberKey(project.projectNo) === key);
+    return withWorklistWrite(async () => {
+      if (sourceRoot !== SOURCE_ROOT || demoMode) throw httpError(409, '票据目录已变化，请刷新');
+      if (!isDeepStrictEqual(projectSignerDefaults[key] ?? null, signer)) {
+        if ([...runs.values()].some((run) => !run.plan.signerOverride && holdsDocument(run) && usesProject(run.plan))) {
+          throw httpError(409, '这个项目有事项正在办理或待核实，请先处理该事项。');
+        }
+        const updated = { ...projectSignerDefaults };
+        if (signer) updated[key] = signer;
+        else delete updated[key];
+        await rememberSigners(signer);
+        await atomicJson(PROJECT_SIGNERS_FILE, updated);
+        projectSignerDefaults = updated;
+        for (const plan of plans.values()) if (usesProject(plan)) applyPlanSigner(plan);
+      }
+      return json(response, 200, { projectSigners: projectSigners(), signerRoster });
+    });
   }
   if (request.method === 'GET' && url.pathname === '/api/funding-summary') {
     const summary = await fundingSnapshot(SOURCE_ROOT);
@@ -1922,7 +2033,7 @@ async function route(request, response) {
       const catalog = { projects, syncedAt: new Date().toISOString() };
       await atomicJson(PROJECTS_FILE, catalog);
       projectCatalog = catalog;
-      return json(response, 200, projectCatalog);
+      return json(response, 200, { ...projectCatalog, projectSigners: projectSigners() });
     });
   }
   if (request.method === 'POST' && url.pathname === '/api/plans') {
@@ -2061,22 +2172,24 @@ async function route(request, response) {
     if (input.subject !== undefined && !Object.hasOwn(SUBJECTS, input.subject)) throw httpError(400, '请选择有效的报销科目');
     let signer;
     try {
-      if (input.signerName !== undefined) {
-        const fallback = Object.values(preferences.signers).find((item) => item?.name === input.signerName);
+      if (Object.hasOwn(input, 'signerOverride')) signer = localSigner(input.signerOverride);
+      else if (input.signerName !== undefined) {
+        const fallback = [...Object.values(preferences.signers), ...Object.values(projectSigners())].find((item) => item?.name === input.signerName);
         signer = localSigner({ name: input.signerName, employeeNo: input.signerEmployeeNo ?? fallback?.employeeNo ?? '' });
         if (!signer) throw new Error('请填写本笔加签人姓名');
       }
     } catch (error) { throw httpError(400, error.message); }
     const sourceRoot = SOURCE_ROOT;
     return withPlanOperation(sourceRoot, folder, () => withWorklistWrite(async () => {
-      if (sourceRoot !== SOURCE_ROOT) throw httpError(409, '票据根目录已变化，请刷新');
+      if (sourceRoot !== SOURCE_ROOT || (input.sourceRoot !== undefined && input.sourceRoot !== sourceRoot)) throw httpError(409, '票据根目录已变化，请刷新');
       const existing = [...plans.values()].filter((plan) => plan.folder === folder && plan.sourceRoot === sourceRoot);
       const latest = existing.at(-1) || null;
+      if (input.planId && input.planId !== latest?.id) throw httpError(409, '事项已变化，请重新检查');
       const subjectChanged = input.subject && latest && input.subject !== latest.subject;
-      if ((signer || subjectChanged || input.bookingOptions !== undefined) && folderHasOpenRun(sourceRoot, folder)) {
+      if ((signer !== undefined || subjectChanged || input.bookingOptions !== undefined) && folderHasOpenRun(sourceRoot, folder)) {
         throw httpError(409, '本笔正在执行或待核实，请先处理当前任务再更新设置');
       }
-      if (signer || input.bookingOptions !== undefined) {
+      if (signer !== undefined || input.bookingOptions !== undefined) {
         if (!latest) throw httpError(404, '事项已变化，请重新检查');
         validatePlanContext(latest);
       }
@@ -2104,13 +2217,14 @@ async function route(request, response) {
         }
       }
       const travelProfile = input.travelProfile?.role ? { role: input.travelProfile.role, fundType: input.travelProfile.fundType === 'research' ? 'research' : 'budget' } : null;
+      if (signer !== undefined) await rememberSigners(signer);
       const changes = await rememberPlanEdit(DATA_APP_DIR, memory, {
         folder,
         folderKey: folderMemoryKey(sourceRoot, folder),
         subject: input.subject,
         expenseType: input.expenseType,
         travelProfile,
-        signerChoice: signer ? { key, signer, fingerprint: latest.fingerprint, projectNo: latest.project.projectNo, funding: latest.funding } : null,
+        signerChoice: signer === undefined ? null : { key, signer },
       });
       const profileChanged = travelProfile && latest?.travelProfile && (latest.travelProfile.role !== travelProfile.role || latest.travelProfile.fundType !== travelProfile.fundType);
       const recheck = Boolean(subjectChanged || profileChanged || bookingChanged);
@@ -2118,14 +2232,11 @@ async function route(request, response) {
         if (recheck) plans.delete(plan.id);
         else {
           if (input.expenseType && EXPENSE_TYPES.includes(input.expenseType)) plan.expenseType = input.expenseType;
-          if (signer) {
-            plan.signer = signer;
-            plan.signerOverride = signer;
-          }
+          if (signer !== undefined) applyPlanSigner(plan);
         }
       }
       if (existing.length || recheck) await savePlans();
-      return json(response, 200, { changes, recheck, signerNames: memory.signerNames, plan: !recheck && latest ? publicPlan(latest) : null });
+      return json(response, 200, { changes, recheck, signerNames: availableSignerNames(), signerRoster, plan: !recheck && latest ? publicPlan(latest) : null });
     }));
   }
   if (request.method === 'GET' && url.pathname === '/api/batches') {

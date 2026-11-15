@@ -37,6 +37,9 @@ let uiReasonSaved;
 let uiGroup = null;
 let uiSigner;
 let uiSignerNames = [];
+const uiTeachingSigner = { name: '示例教学加签人', employeeNo: '980001' };
+let uiSignerRoster = [uiTeachingSigner];
+let uiProjectSigners = {};
 const uiFolder = '办公用品/模拟批次';
 const uiSecondFolder = '办公用品/案例讲义';
 const uiGroupKey = '@事项/11111111-1111-4111-8111-111111111111';
@@ -48,7 +51,18 @@ const projectFixture = [
 ];
 const uiProjects = [...projectFixture, { projectNo: 'TEST-2026-03', projectName: '模拟案例经费', totalCny: 100000, balanceCny: 100000 }];
 const sourceDir = fileURLToPath(new URL('..', import.meta.url));
-const uiPlan = () => ({ id: '22222222-2222-4222-8222-222222222222', folder: uiGroupKey, groupId: '11111111-1111-4111-8111-111111111111', displayName: uiFolder, sourceFolders: [uiFolder, uiSecondFolder], subject: '办公用品', funding: '教学', status: 'blocked', blockers: ['请先保存事由'], warnings: ['缺少已核对签字的签收单'], rows: [{ invoiceNumber: number, invoiceAmountCny: 10000, paidAmountCny: 9876, reimbursementAmountCny: 9876 }], totalCny: 9876, invoiceTotalCny: 10000, paidTotalCny: 9876, uploadFiles: ['发票.pdf', '付款凭证.png'], batches: [['发票.pdf', '付款凭证.png']], uploadSource: 'rule', uploadTypes: {}, supportingFiles: [], confirmations: {}, project: uiProject || { projectNo: '', projectName: '' }, reason: '', signer: { name: '示例教学加签人', employeeNo: '980001' }, fingerprint: 'fixture', cacheState: 'cached' });
+function rememberUiSigner(signer) {
+  if (signer && !uiSignerRoster.some(({ name, employeeNo }) => name === signer.name && employeeNo === signer.employeeNo)) {
+    uiSignerRoster.push(signer);
+  }
+}
+
+function uiSignerFields() {
+  const projectSigner = uiProjectSigners[uiProject?.projectNo];
+  const signerDefault = projectSigner ?? uiTeachingSigner;
+  return { signerDefault, signerDefaultSource: projectSigner ? 'project' : 'funding', signerOverride: uiSigner ?? null, signer: uiSigner ?? signerDefault };
+}
+const uiPlan = () => ({ id: '22222222-2222-4222-8222-222222222222', folder: uiGroupKey, groupId: '11111111-1111-4111-8111-111111111111', displayName: uiFolder, sourceFolders: [uiFolder, uiSecondFolder], subject: '办公用品', funding: '教学', status: 'blocked', blockers: ['请先保存事由'], warnings: ['缺少已核对签字的签收单'], rows: [{ invoiceNumber: number, invoiceAmountCny: 10000, paidAmountCny: 9876, reimbursementAmountCny: 9876 }], totalCny: 9876, invoiceTotalCny: 10000, paidTotalCny: 9876, uploadFiles: ['发票.pdf', '付款凭证.png'], batches: [['发票.pdf', '付款凭证.png']], uploadSource: 'rule', uploadTypes: {}, supportingFiles: [], confirmations: {}, project: uiProject || { projectNo: '', projectName: '' }, reason: '', ...uiSignerFields(), fingerprint: 'fixture', cacheState: 'cached' });
 
 async function payload(request) {
   let body = '';
@@ -205,7 +219,7 @@ function fixtureHtml() {
 
 test.before(async () => {
   server = http.createServer(async (request, response) => {
-    if (['/runner', '/app.js', '/styles.css', '/project-allocation.js', '/model-settings.js', '/funding-summary.js', '/payroll.js', '/review-archive.js'].includes(request.url)) {
+    if (['/runner', '/app.js', '/styles.css', '/project-allocation.js', '/model-settings.js', '/funding-summary.js', '/payroll.js', '/review-archive.js', '/signer-picker.js'].includes(request.url)) {
       const name = request.url === '/runner' ? 'index.html' : request.url.slice(1);
       response.setHeader('content-type', name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html; charset=utf-8');
       return response.end(await readFile(join(sourceDir, 'public', name)));
@@ -215,9 +229,17 @@ test.before(async () => {
       const json = (value) => response.end(JSON.stringify(value));
       if (request.url === '/api/health') return json({ ok: true, deepseekConfigured: false, model: 'fixture' });
       if (request.url === '/api/config') return json({ sourceRoot: uiSourceRoot, defaultSourceRoot: uiSourceRoot, paymentCardConfigured: true });
-      if (request.url === '/api/projects') return json({ projects: uiProjects.map(({ projectNo, projectName }) => ({ projectNo, projectName })), syncedAt: null });
-      if (request.url === '/api/projects/sync') return json({ projects: uiProjects, syncedAt: '2026-11-10T01:00:00Z' });
-      if (request.url === '/api/folders') return json({ sourceRoot: uiSourceRoot, signerNames: uiSignerNames, folders: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...[uiFolder, uiSecondFolder].map(path => ({ path, fileCount: uiSourceRefresh && path === uiFolder ? 4 : 3, reimbursed: false, claimKey: uiGroup?.key, claimLabel: uiGroup?.name }))], claims: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...(uiGroup ? [{ path: uiGroup.key, groupId: uiGroup.id, label: uiGroup.name, sourceFolders: uiGroup.folders, subject: '办公用品', fileCount: 6, reimbursed: false, match: uiMatch, reasonDraft: uiReasonDraft, reasonSaved: uiReasonSaved, offlineBooking: uiGroup.bookingOptions?.offline === true }] : [])] });
+      if (request.url === '/api/projects') return json({ projects: uiProjects.map(({ projectNo, projectName }) => ({ projectNo, projectName })), syncedAt: null, projectSigners: uiProjectSigners });
+      if (request.url === '/api/projects/sync') return json({ projects: uiProjects, syncedAt: '2026-11-10T01:00:00Z', projectSigners: uiProjectSigners });
+      if (request.url === '/api/project-signer') {
+        const { sourceRoot, projectNo, signer } = await payload(request);
+        assert.equal(sourceRoot, uiSourceRoot);
+        if (signer) uiProjectSigners[projectNo] = signer;
+        else delete uiProjectSigners[projectNo];
+        rememberUiSigner(signer);
+        return json({ projectSigners: uiProjectSigners, signerRoster: uiSignerRoster });
+      }
+      if (request.url === '/api/folders') return json({ sourceRoot: uiSourceRoot, signerNames: uiSignerNames, signerRoster: uiSignerRoster, folders: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...[uiFolder, uiSecondFolder].map(path => ({ path, fileCount: uiSourceRefresh && path === uiFolder ? 4 : 3, reimbursed: false, claimKey: uiGroup?.key, claimLabel: uiGroup?.name }))], claims: [{ path: uiArchived, fileCount: 3, reimbursed: true }, ...(uiGroup ? [{ path: uiGroup.key, groupId: uiGroup.id, label: uiGroup.name, sourceFolders: uiGroup.folders, subject: '办公用品', fileCount: 6, reimbursed: false, match: uiMatch, reasonDraft: uiReasonDraft, reasonSaved: uiReasonSaved, offlineBooking: uiGroup.bookingOptions?.offline === true }] : [])] });
       if (request.url === '/api/claim-groups') {
         const input = await payload(request);
         assert.deepEqual(input.folders.sort(), [uiFolder, uiSecondFolder].sort());
@@ -255,12 +277,13 @@ test.before(async () => {
         return json({ match: uiMatch });
       }
       if (request.url === '/api/plan-override') {
-        const { folder, signerName } = await payload(request);
+        const { folder, signerOverride } = await payload(request);
         assert.equal(folder, uiGroupKey);
-        uiSigner = { name: signerName, employeeNo: '' };
-        if (!uiSignerNames.includes(signerName)) uiSignerNames.push(signerName);
-        uiPreparedPlan = { ...uiPreparedPlan, signer: uiSigner };
-        return json({ plan: uiPreparedPlan, signerNames: uiSignerNames });
+        if (signerOverride !== undefined) uiSigner = signerOverride;
+        if (uiSigner && !uiSignerNames.includes(uiSigner.name)) uiSignerNames.push(uiSigner.name);
+        rememberUiSigner(uiSigner);
+        uiPreparedPlan = { ...uiPreparedPlan, ...uiSignerFields() };
+        return json({ plan: uiPreparedPlan, signerNames: uiSignerNames, signerRoster: uiSignerRoster });
       }
       if (request.url === '/api/runs') return json({ runs: [] });
       if (request.url === '/api/batches') return json({ batches: [] });
@@ -276,7 +299,6 @@ test.before(async () => {
         assert.equal(input.folder, uiGroupKey);
         uiProject = input.project;
         const plan = { ...uiPlan(), funding: uiMatch?.funding || '教学', reimbursementRoute: uiGroup?.bookingOptions?.offline ? 'legacy' : 'smart' };
-        if (uiSigner) plan.signer = uiSigner;
         if (uiMatch?.allocations) {
           const { error } = allocateProjects(uiMatch.allocations, plan.totalCny);
           Object.assign(plan, { projectAllocationDraft: uiMatch.allocations, reason: uiReasonSaved ? uiReasonDraft : '', status: error || !uiReasonSaved ? 'blocked' : 'ready', blockers: error ? [error] : [] });
@@ -1120,7 +1142,7 @@ test('the worklist filters by reimbursement system and selects smart and daily o
   await row('劳务发放').getByRole('button', { name: '详情' }).click();
   await page.locator('#detailContent').getByText('劳务发放清单.xlsx', { exact: true }).waitFor();
   assert.equal(await page.locator('#detailContent').getByLabel('报销科目').inputValue(), '劳务费');
-  assert.equal(await page.locator('#editSignerName').count(), 0);
+  assert.equal(await page.locator('#detailSignerPicker select').count(), 0);
 });
 
 test('the Didi worklist saves the cap first and sends its right-column match for execution', async (t) => {
@@ -1129,21 +1151,37 @@ test('the Didi worklist saves the cap first and sends its right-column match for
   const id = '17171717-1717-4171-8171-171717171717';
   const path = '@事项/' + id;
   const project = projectFixture[0];
+  const projectSigner = { name: '模拟默认加签人', employeeNo: 'TEST-911' };
+  const override = { name: '模拟本笔加签人', employeeNo: 'TEST-912' };
   let item;
   let execution;
   await context.route('**/*', (route) => {
     const { pathname } = new URL(route.request().url());
     if (pathname === '/api/projects') return route.fulfill({ json: { projects: [project] } });
-    if (pathname === '/api/folders') return route.fulfill({ json: { sourceRoot: uiSourceRoot, folders: [], claims: item ? [item] : [] } });
+    if (pathname === '/api/folders') return route.fulfill({ json: {
+      sourceRoot: uiSourceRoot, folders: [], claims: item ? [item] : [], signerRoster: [projectSigner, override],
+    } });
     if (pathname === '/api/didi-claims') {
-      assert.deepEqual(route.request().postDataJSON(), { sourceRoot: uiSourceRoot, budget: '150.25' });
+      assert.deepEqual(route.request().postDataJSON(), {
+        sourceRoot: uiSourceRoot, budget: '150.25', signerOverride: null,
+      });
       item = { path, groupId: id, label: '贸大出行', subject: '贸大出行', match: null, sourceFolders: [], didi: { budgetCny: 15025, blocker: '请在右栏匹配一个经费项目', revision: 'initial' } };
       return route.fulfill({ status: 201, json: { id, key: path } });
+    }
+    if (pathname === '/api/didi-claims/' + id) {
+      assert.deepEqual(route.request().postDataJSON(), {
+        sourceRoot: uiSourceRoot, budget: '150.25', revision: 'confirmed', signerOverride: override,
+      });
+      item.didi = { ...item.didi, revision: 'override', signerOverride: override, signer: override };
+      return route.fulfill({ json: { id, key: path } });
     }
     if (pathname === '/api/project-match') {
       const match = route.request().postDataJSON().match;
       assert.equal(match.projectNo, project.projectNo);
-      item = { ...item, match, didi: { ...item.didi, blocker: '请写清用车事由并保存', revision: 'matched' } };
+      item = { ...item, match, didi: {
+        ...item.didi, blocker: '请写清用车事由并保存', revision: 'matched',
+        signerDefault: projectSigner, signerDefaultSource: 'project', signer: projectSigner,
+      } };
       return route.fulfill({ json: { match } });
     }
     if (pathname === '/api/claim-reason') {
@@ -1174,10 +1212,17 @@ test('the Didi worklist saves the cap first and sends its right-column match for
   await row.getByRole('textbox', { name: /报销事由/ }).fill('走访金融实训合作企业的用车费用');
   await row.getByRole('button', { name: '保存事由' }).click();
   await row.getByText('可执行', { exact: true }).waitFor();
+  await row.getByRole('button', { name: '详情', exact: true }).click();
+  const details = page.getByRole('dialog', { name: '贸大出行详情' });
+  const didiSigner = details.getByRole('combobox', { name: '本笔加签人', exact: true });
+  assert.match(await didiSigner.locator('option:checked').textContent(), /项目默认 · 模拟默认加签人/);
+  await didiSigner.selectOption({ label: override.name + ' · ' + override.employeeNo });
+  await details.getByRole('button', { name: '保存详情' }).click();
+  await page.getByText('贸大出行详情已更新。', { exact: true }).waitFor();
   await row.getByRole('checkbox', { name: '执行 贸大出行' }).check();
   await page.getByRole('button', { name: '填报选中项', exact: true }).click();
   await page.getByText(/批次已启动，共 1 笔/).waitFor();
-  assert.deepEqual(execution, { entries: [{ didiId: id, revision: 'confirmed' }] });
+  assert.deepEqual(execution, { entries: [{ didiId: id, revision: 'override' }] });
 });
 
 test('a payroll declaration pauses for a choice between school results with the same name', async (t) => {
@@ -1201,6 +1246,7 @@ test('a payroll declaration pauses for a choice between school results with the 
       payrollPositions: ['正高', '副高', '其他'],
       payrollExpenseItems: ['其他劳务费', '讲座费'],
       payrollSignerNames: { 科研项目: '示例科研加签人', 非科研项目: '示例教学加签人' },
+      signerRoster: [uiTeachingSigner, { name: '共享名单测试人', employeeNo: '' }],
       claims: draft ? [{ path: '@事项/' + key, groupId: key, label: draft.reason, subject: '劳务费', match,
         payroll: { category: draft.category, peopleCount: 1, totalCny: 12345, revision: 'revision', blocker: match ? '' : '请在右栏匹配薪酬申报的经费项目。' } }] : [],
     } });
@@ -1251,6 +1297,10 @@ test('a payroll declaration pauses for a choice between school results with the 
   assert.equal(await form.locator('#payrollSigner').innerText(), '示例科研加签人');
   await form.getByLabel('发放类型').fill('非科研项目');
   assert.equal(await form.locator('#payrollSigner').innerText(), '示例教学加签人');
+  const payrollSigner = form.getByRole('combobox', { name: '本笔加签人', exact: true });
+  await payrollSigner.selectOption({ label: '共享名单测试人' });
+  assert.equal(await form.locator('#payrollSigner').innerText(), '共享名单测试人');
+  await payrollSigner.selectOption('default');
   await form.getByLabel('发放内容（报销事由）').fill('整理案例访谈记录');
   await form.getByLabel('姓名', { exact: true }).fill('模拟同名');
   await form.getByRole('button', { name: '查学校人员' }).click();
@@ -2179,6 +2229,9 @@ test('the worklist groups source folders before saving purpose, matching funding
   uiGroup = null;
   uiSigner = undefined;
   uiSignerNames = [];
+  uiSignerRoster = [uiTeachingSigner];
+  uiProjectSigners = {};
+  t.after(() => { uiProjectSigners = {}; uiSignerRoster = [uiTeachingSigner]; });
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
   t.after(() => context.close());
   await context.route('**/*', (route) => route.request().url().startsWith(origin) ? route.continue() : route.abort());
@@ -2239,6 +2292,20 @@ test('the worklist groups source folders before saving purpose, matching funding
   const research = page.locator('.project-match', { hasText: '模拟科研经费' });
   assert.equal(await research.locator('.project-balance').innerText(), '可用金额 ¥0.00');
   assert.doesNotMatch(await research.innerText(), /项目总额/);
+  await teaching.getByRole('button', { name: '设置加签人 模拟教学经费' }).click();
+  const signerDialog = page.getByRole('dialog', { name: '项目默认加签人' });
+  const projectPicker = signerDialog.getByRole('combobox', { name: '项目默认加签人', exact: true });
+  assert.match(await projectPicker.textContent(), /示例教学加签人 · 980001/);
+  await projectPicker.selectOption('new');
+  const newSignerName = signerDialog.getByLabel('加签人姓名', { exact: true });
+  await signerDialog.getByRole('button', { name: '保存默认加签人' }).click();
+  assert.equal(await newSignerName.evaluate((input) => input.validity.valid), false);
+  assert.equal(await signerDialog.getByLabel('工号（可选）').evaluate((input) => input.required), false);
+  await newSignerName.fill('模拟项目默认人');
+  await signerDialog.getByRole('button', { name: '保存默认加签人' }).click();
+  await signerDialog.waitFor({ state: 'hidden' });
+  await teaching.getByText('默认加签人 模拟项目默认人').waitFor();
+  await page.locator('.row-state', { hasText: '待匹配' }).waitFor();
   await page.locator('.row-select').uncheck();
   await teaching.getByRole('button', { name: '匹配 模拟教学经费' }).click();
   await page.locator('.row-state', { hasText: '待补充/核对' }).waitFor();
@@ -2298,12 +2365,22 @@ test('the worklist groups source folders before saving purpose, matching funding
   assert.match(await page.locator('#detailContent').innerText(), /缺少已核对签字/);
   await page.getByText(`学校页面填写内容 ${revised}`).waitFor();
   await page.getByText('有提醒，可以执行', { exact: true }).waitFor();
-  const signerPicker = page.locator('#editSignerName');
-  await signerPicker.selectOption({ label: '手动输入姓名' });
-  await page.locator('#customSignerName').fill('　模拟加签人　');
+  const signerPicker = page.locator('#detailSignerPicker select');
+  assert.match(await signerPicker.locator('option:checked').textContent(), /项目默认 · 模拟项目默认人/);
+  assert.ok((await signerPicker.locator('option').allTextContents()).includes('模拟项目默认人'));
+  assert.match(await signerPicker.textContent(), /示例教学加签人 · 980001/);
+  await signerPicker.selectOption('new');
+  await page.locator('#detailSignerPicker [data-signer-name]').fill('　模拟加签人　');
   await page.getByRole('button', { name: '保存设置' }).click();
-  await page.locator('#editSignerName option:checked', { hasText: '模拟加签人' }).waitFor({ state: 'attached' });
+  await signerPicker.locator('option:checked', { hasText: '模拟加签人' }).waitFor({ state: 'attached' });
   assert.deepEqual(uiSignerNames, ['模拟加签人']);
+  await signerPicker.selectOption('default');
+  await page.getByRole('button', { name: '保存设置' }).click();
+  await page.locator('#editStatus', { hasText: '已保存' }).waitFor();
+  assert.equal(uiSigner, null);
+  await signerPicker.selectOption({ label: '模拟加签人' });
+  await page.getByRole('button', { name: '保存设置' }).click();
+  await page.locator('#editStatus', { hasText: '已保存' }).waitFor();
   await page.locator('#closeDetail').click();
   await page.locator('.row-state', { hasText: '有提醒，可执行' }).waitFor();
   assert.match(await page.locator('.folder-figure').innerText(), /98\.76[\s\S]*核定报销/);
@@ -2356,7 +2433,7 @@ test('the worklist groups source folders before saving purpose, matching funding
   assert.equal(await reopened.locator('.allocation-remainder').innerText(), '¥48.00');
   assert.equal(await reopened.getByLabel(`报销事由 ${uiFolder}`).inputValue(), revised);
   await reopened.getByRole('button', { name: '详情', exact: true }).click();
-  assert.equal(await reopened.locator('#editSignerName').inputValue(), '模拟加签人');
+  assert.equal(await reopened.locator('#detailSignerPicker option:checked').textContent(), '模拟加签人');
   await reopened.locator('#closeDetail').click();
   assert.equal(await reopened.locator('.reason-action').innerText(), '更新事由');
   assert.equal(await reopened.locator('.row-select').isChecked(), false);

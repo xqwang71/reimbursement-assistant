@@ -1,3 +1,7 @@
+export function projectNumberKey(projectNo) {
+  return String(projectNo ?? '').normalize('NFKC').trim().toUpperCase();
+}
+
 export function matchProjects(match) {
   if (!match) return [];
   if (Array.isArray(match.allocations)) return match.allocations;
