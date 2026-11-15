@@ -2320,6 +2320,15 @@ async function route(request, response) {
     const message = String(input.message || '').trim();
     if (!message) return json(response, 400, { error: '请输入指令或问题' });
     const compact = message.replace(/\s/g, '');
+    const reportedSubmission = /^(?:我)?(?:已(?:经)?(?:手动)?提交(?:掉了|了|成功)?|(?:手动)?提交(?:掉了|了|成功))[。.!！]?$/.test(compact);
+    const canRecord = ['verification_required', 'preview', 'error'].includes(run.status) && holdsDocument(run) &&
+      run.control.progress.submission.state !== 'verified' && run.plan.reimbursementRoute === 'smart' && !run.plan.didi && !run.plan.payrollRevision;
+    if (reportedSubmission && (canRecord || run.status === 'completed')) {
+      addMessage(run, 'user', message);
+      addMessage(run, 'assistant', canRecord ? '请点「登记手动提交」，填写该笔学校回执的报销单号。' : '本笔学校回执已登记。');
+      await saveRuns();
+      return json(response, 200, { run: publicRun(run) });
+    }
     const initialQuestion = pending.get(run.id)?.metadata.kind;
     let directive = directInstruction(message);
     let intent = { action: 'chat' };

@@ -1005,6 +1005,41 @@ test('a recognized payment can be linked before funding allocation and stays vis
   assert.equal(executions, 0);
 });
 
+test('registering a manual school receipt clears a stale batch failure label', async (t) => {
+  const context = await browser.newContext();
+  t.after(() => context.close());
+  const createdAt = '2026-07-08T02:00:00Z';
+  const plan = { ...uiPlan(), reimbursementRoute: 'smart' };
+  const run = { id: 'test-receipt-run', plan, status: 'error', error: '支付未完成', canEndDraft: true,
+    createdAt, updatedAt: createdAt, events: [], messages: [] };
+  let payload;
+  await context.route('**/*', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.origin !== origin) return route.abort();
+    if (url.pathname === '/api/folders') return route.fulfill({ json: { sourceRoot: uiSourceRoot, folders: [], claims: [] } });
+    if (url.pathname === '/api/runs') return route.fulfill({ json: { runs: [run], blockingRunId: run.canEndDraft ? run.id : null } });
+    if (url.pathname === '/api/batches') return route.fulfill({ json: {
+      batches: [{ id: 'test-manual-batch', status: 'error', currentIndex: 0, currentRunId: run.id, createdAt, runs: [run] }],
+    } });
+    if (url.pathname === `/api/runs/${run.id}/resolution`) {
+      payload = route.request().postDataJSON();
+      Object.assign(run, { status: 'completed', canEndDraft: false, error: null });
+      return route.fulfill({ json: { run } });
+    }
+    assert.ok(!url.pathname.endsWith('/instructions'));
+    return route.continue();
+  });
+  const page = await context.newPage();
+  await page.goto(`${origin}/runner`);
+  await page.locator('#viewBlockingRun').click();
+  await page.locator('#runStatus', { hasText: '批次失败' }).waitFor();
+  page.once('dialog', (dialog) => dialog.accept('TEST-RECEIPT-001'));
+  await page.getByRole('button', { name: '登记手动提交', exact: true }).click();
+  await page.locator('#runStatus', { hasText: '批次已完成' }).waitFor();
+  assert.deepEqual(payload, { confirmed: true, resolution: 'submitted', financeFormId: 'TEST-RECEIPT-001' });
+  await page.locator('#blockingRunNotice').waitFor({ state: 'hidden' });
+});
+
 test('the worklist filters by reimbursement system and selects smart and daily offline claims for a batch', async (t) => {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   t.after(() => context.close());

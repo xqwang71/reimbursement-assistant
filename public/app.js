@@ -1509,6 +1509,10 @@ function currentRun() {
   return state.run;
 }
 
+function canRecordSubmission(run) {
+  return run?.canEndDraft && run.plan.reimbursementRoute === 'smart' && !run.plan.didi && !run.plan.payrollRevision;
+}
+
 function renderRun() {
   const run = currentRun();
   const year = otherRunYear(run);
@@ -1516,6 +1520,7 @@ function renderRun() {
   $('draftActions').hidden = Boolean(year) || (!run?.canResumePreview && !run?.canEndDraft);
   $('resumeDraft').hidden = !run?.canResumePreview;
   $('endDraft').hidden = !run?.canEndDraft;
+  $('recordSubmission').hidden = !canRecordSubmission(run);
   $('replyForm').hidden = Boolean(year);
   if ($('draftActionStatus').dataset.runId !== run?.id) $('draftActionStatus').hidden = true;
   if (!run) {
@@ -1530,8 +1535,10 @@ function renderRun() {
   $('runStatus').className = `run-status ${waitingLogin ? 'waiting_input' : run.status}`;
   const started = new Date(state.batch?.createdAt || run.createdAt);
   const time = Number.isFinite(started.getTime()) ? started.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+  const batchStatus = state.batch?.status === 'error' && state.batch.runs.every((item) => item.status === 'completed')
+    ? 'completed' : state.batch?.status;
   const batchText = state.batch
-    ? `批次${batchStatusLabels[state.batch.status] || state.batch.status} · 第 ${Math.min((state.batch.currentIndex ?? 0) + 1, state.batch.runs.length)}/${state.batch.runs.length} 笔 · `
+    ? `批次${batchStatusLabels[batchStatus] || batchStatus} · 第 ${Math.min((state.batch.currentIndex ?? 0) + 1, state.batch.runs.length)}/${state.batch.runs.length} 笔 · `
     : '';
   const error = executionError(run.error);
   $('runStatus').textContent = `${batchText}${time ? `${time} 启动 · ` : ''}${runStatusLabel(run)} · ${runReference(run)}${error ? ` · ${error}` : ''}`;
@@ -1581,32 +1588,40 @@ async function sendRunMessage(message) {
   }
 }
 
-async function updateOriginalDraft(end) {
+async function updateOriginalDraft(action) {
   const run = currentRun();
-  if (!run || otherRunYear(run) || (end ? !run.canEndDraft : !run.canResumePreview)) return;
+  if (!run || otherRunYear(run)) return;
+  const resume = action === 'resume';
+  const submitted = action === 'submitted';
+  if (!(resume ? run.canResumePreview : submitted ? canRecordSubmission(run) : run.canEndDraft)) return;
   const status = $('draftActionStatus');
   if ($('resumeDraft').disabled) return;
-  if (end && !window.confirm('请确认你已在学校系统作废或删除了这张草稿，并核实从未提交。登记后可开始其他事项。')) return;
+  if (action === 'abandon_draft' && !window.confirm('请确认你已在学校系统作废或删除了这张草稿，并核实从未提交。登记后可开始其他事项。')) return;
+  const financeFormId = submitted ? window.prompt(`请核对「${runReference(run)}」已在学校提交，并填入该笔回执上的学校报销单号。`)?.trim() : undefined;
+  if (submitted && !financeFormId) return;
   status.dataset.runId = run.id;
   status.hidden = false;
-  status.textContent = end ? '正在保存核实结果…' : '正在接回原草稿…';
-  $('resumeDraft').disabled = $('endDraft').disabled = true;
+  status.textContent = resume ? '正在接回原草稿…' : '正在保存核实结果…';
+  $('resumeDraft').disabled = $('endDraft').disabled = $('recordSubmission').disabled = true;
   try {
-    const result = end
-      ? await api(`/api/runs/${run.id}/resolution`, { method: 'POST', body: JSON.stringify({ confirmed: true, resolution: 'abandon_draft' }) })
-      : await api(`/api/runs/${run.id}/instructions`, { method: 'POST', body: JSON.stringify({ message: '继续' }) });
-    if (result.batch) state.batch = result.batch;
-    if (state.batch) {
-      const index = state.batch.runs.findIndex(({ id }) => id === run.id);
-      if (index >= 0) state.batch.runs[index] = result.run;
-    } else state.run = result.run;
-    status.textContent = end ? '已登记原草稿作废。可返回工作清单移除事项或开始新批次。' : '原任务已恢复，进度见上方。';
+    const result = resume
+      ? await api(`/api/runs/${run.id}/instructions`, { method: 'POST', body: JSON.stringify({ message: '继续' }) })
+      : await api(`/api/runs/${run.id}/resolution`, { method: 'POST', body: JSON.stringify({ confirmed: true, resolution: action, financeFormId }) });
+    if (!submitted) {
+      if (result.batch) state.batch = result.batch;
+      if (state.batch) {
+        const index = state.batch.runs.findIndex(({ id }) => id === run.id);
+        if (index >= 0) state.batch.runs[index] = result.run;
+      } else state.run = result.run;
+    }
+    status.textContent = resume ? '原任务已恢复，进度见上方。' : submitted
+      ? '学校回执已登记。' : '已登记原草稿作废。可返回工作清单移除事项或开始新批次。';
     $('executionFeedback').hidden = true;
     await refreshExecution();
   } catch (error) {
-    status.textContent = `未能${end ? '登记' : '接回原草稿'}。${error.message}`;
+    status.textContent = `未能${resume ? '接回原草稿' : '登记'}。${error.message}`;
   } finally {
-    $('resumeDraft').disabled = $('endDraft').disabled = false;
+    $('resumeDraft').disabled = $('endDraft').disabled = $('recordSubmission').disabled = false;
   }
 }
 
@@ -2128,8 +2143,9 @@ $('workspaceYear').addEventListener('change', renderWorkspaceChoice);
 $('returnToDemo').addEventListener('click', () => saveRoot(true));
 $('confirmSubmission').addEventListener('click', () => sendRunMessage('确认提交'));
 $('skipSubmission').addEventListener('click', () => sendRunMessage('先别提交'));
-$('resumeDraft').addEventListener('click', () => updateOriginalDraft(false));
-$('endDraft').addEventListener('click', () => updateOriginalDraft(true));
+$('recordSubmission').addEventListener('click', () => updateOriginalDraft('submitted'));
+$('resumeDraft').addEventListener('click', () => updateOriginalDraft('resume'));
+$('endDraft').addEventListener('click', () => updateOriginalDraft('abandon_draft'));
 $('viewBlockingRun').addEventListener('click', () => setRunDrawer(true));
 $('settingsDialog').addEventListener('close', () => { $('paymentCardLast4').value = ''; });
 $('basicSettingsForm').addEventListener('submit', (event) => {

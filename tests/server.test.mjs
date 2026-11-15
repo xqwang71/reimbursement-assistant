@@ -1339,6 +1339,10 @@ test('different invoices cannot reuse the same transaction in a batch or after v
     id: batchId, runIds: [runId], currentRunId: runId, currentIndex: 0, status: 'preview',
   }]));
   await app.start();
+  const manual = await app.request(`/api/runs/${runId}/instructions`, { message: '已手动提交' });
+  assert.equal(manual.status, 200);
+  assert.equal(manual.body.run.status, 'preview');
+  assert.match(manual.body.run.messages.at(-1).text, /登记手动提交.*报销单号/);
   const resolved = await app.request(`/api/runs/${runId}/resolution`, { confirmed: true, resolution: 'submitted', financeFormId: 'TEST-DOC-001' });
   assert.equal(resolved.status, 200, JSON.stringify(resolved.body));
   assert.equal(resolved.body.run.status, 'completed');
