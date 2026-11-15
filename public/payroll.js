@@ -1,3 +1,5 @@
+import { mountSignerPicker } from './signer-picker.js';
+
 export function bindPayrollForm({ api, $, money, getContext, onSave }) {
   const dialog = $('payrollDialog');
   const form = $('payrollForm');
@@ -14,12 +16,16 @@ export function bindPayrollForm({ api, $, money, getContext, onSave }) {
   let editing = null;
   let formRoot = '';
   let opening = false;
+  let signerPicker;
 
   function renderSigner() {
+    if (!signerPicker) return;
     const { signerNames } = getContext();
     const type = grantType.value.trim();
-    const projectSigner = editing?.projectSigner;
-    $('payrollSigner').textContent = form.elements.namedItem('signerName').value.trim() || projectSigner?.name || signerNames[type] || '待确认';
+    const fallback = editing?.projectSigner?.name || signerNames[type];
+    signerPicker.setDefaultLabel(fallback ? `沿用默认（${fallback}）` : '沿用默认');
+    const selected = signerPicker.value();
+    $('payrollSigner').textContent = selected ? selected.name || '待填写姓名' : fallback || '待确认';
   }
 
   function renderTotal() {
@@ -189,9 +195,11 @@ export function bindPayrollForm({ api, $, money, getContext, onSave }) {
       $('savePayroll').textContent = editing ? '更新申报' : '保存申报';
       if (draft) {
         for (const name of ['category', 'grantType', 'reason']) form.elements.namedItem(name).value = draft[name];
-        form.elements.namedItem('signerName').value = draft.signerOverride?.name || '';
-        form.elements.namedItem('signerEmployeeNo').value = draft.signerOverride?.employeeNo || '';
       }
+      signerPicker = mountSignerPicker($('payrollSignerPicker'), {
+        label: '本笔加签人', roster: getContext().signerRoster, selected: draft?.signerOverride,
+        defaultLabel: '沿用默认', onChange: renderSigner,
+      });
       renderSigner();
       for (const person of draft?.people || [{}]) addPerson(person);
       dialog.showModal();
@@ -207,7 +215,6 @@ export function bindPayrollForm({ api, $, money, getContext, onSave }) {
   });
   $('closePayroll').addEventListener('click', () => dialog.close());
   grantType.addEventListener('input', renderSigner);
-  form.elements.namedItem('signerName').addEventListener('input', renderSigner);
   category.addEventListener('change', () => {
     for (const row of rows()) {
       setExpenseItem(row);
@@ -261,7 +268,7 @@ export function bindPayrollForm({ api, $, money, getContext, onSave }) {
     }
     const payload = { sourceRoot: formRoot, revision: editing?.revision };
     for (const name of ['category', 'grantType', 'reason']) payload[name] = form.elements.namedItem(name).value;
-    payload.signerOverride = { name: form.elements.namedItem('signerName').value, employeeNo: form.elements.namedItem('signerEmployeeNo').value };
+    payload.signerOverride = signerPicker.value();
     payload.people = rows().map((row) => Object.fromEntries([...row.querySelectorAll('[name]:not(:disabled)')].map((control) => [control.name, control.value])));
     button.disabled = true;
     status.textContent = '正在保存…';

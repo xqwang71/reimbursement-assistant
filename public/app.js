@@ -3,6 +3,7 @@ import { bindModelSettings } from './model-settings.js';
 import { bindFundingSummary } from './funding-summary.js';
 import { bindPayrollForm } from './payroll.js';
 import { bindReviewArchive } from './review-archive.js';
+import { mountSignerPicker } from './signer-picker.js';
 
 const SUBJECTS = ['电脑配件', '办公用品', '书籍资料', 'AI服务', '数据服务', '境外软件订阅', '劳务费', '差旅', '其他'];
 const ROUTE_LABELS = { smart: '智能报销系统', legacy: '日常线下报销', labor: '薪酬申报', split: '混合结算', review: '办理系统待核对' };
@@ -41,7 +42,7 @@ const state = {
   payrollPositions: [],
   payrollExpenseItems: [],
   payrollSignerNames: {},
-  signerNames: [],
+  signerRoster: [],
   projectSyncedAt: null,
   activeFolder: '',
   selected: new Set(),
@@ -736,6 +737,12 @@ function defaultSignerLabel({ signerDefault, signerDefaultSource }) {
   return (signerDefaultSource === 'project' ? '项目默认 · ' : '经费口径备用 · ') + signerDefault.name;
 }
 
+function applySignerRoster(result) {
+  if (Array.isArray(result.signerRoster)) state.signerRoster = result.signerRoster;
+  else if (Array.isArray(result.signerNames)) state.signerRoster = result.signerNames.map((name) => ({ name, employeeNo: '' }));
+}
+
+let detailSignerPicker;
 function renderPlanDetails(plan) {
   const recognized = recognizedPaymentTotal(plan);
   const showRecognized = recognized !== null && (paymentReviewNeeded(plan) || !Number.isSafeInteger(plan.paidTotalCny));
@@ -763,8 +770,6 @@ function renderPlanDetails(plan) {
   }).join('');
   const expenseTypeOptions = ['<option value="">执行时确认</option>', ...EXPENSE_TYPES.map((type) => `<option value="${type}" ${plan.expenseType === type ? 'selected' : ''}>${type}</option>`)].join('');
   const subjectOptions = SUBJECTS.map((subject) => `<option value="${subject}" ${plan.subject === subject ? 'selected' : ''}>${subject}</option>`).join('');
-  const signerNames = [...new Set([...state.signerNames, plan.signer?.name].filter(Boolean))];
-  const signerOptions = signerNames.map((name) => `<option value="${escapeHtml(name)}" ${plan.signerOverride?.name === name ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('');
   return `<div class="plan">
     <section class="detail-section"><h3>办理系统</h3><p>${routeLabel}</p></section>
     ${labor ? '' : `<div class="metrics"><div class="metric"><small>发票总额</small><strong>${money(plan.invoiceTotalCny)}</strong></div><div class="metric"><small>${showRecognized ? '已识别付款' : '已关联实付'}</small><strong>${money(showRecognized ? recognized : plan.paidTotalCny)}</strong></div><div class="metric"><small>核定报销</small><strong>${money(plan.totalCny)}</strong></div></div>`}
@@ -777,9 +782,7 @@ function renderPlanDetails(plan) {
         ${offline ? `<label>纸质附件张数<input id="editPaperCount" type="number" min="1" max="50" step="1" value="${plan.attachmentCount ?? ''}"></label>` : ''}
       `}
       ${offline ? '' : `<label>费用类型<select id="editExpenseType">${expenseTypeOptions}</select></label>
-        <label>本笔加签人<select id="editSignerName"><option value=":default" data-use-default ${plan.signerOverride ? '' : 'selected'}>沿用默认（${escapeHtml(defaultSignerLabel(plan))}）</option>${signerOptions}<option value="">手动输入姓名</option></select></label>
-        <label id="customSignerEntry" hidden>加签人姓名<input id="customSignerName" type="text" maxlength="80" autocomplete="off"></label>
-        <label>本笔加签人工号（可选）<input id="editSignerCode" type="text" maxlength="30" autocomplete="off" value="${escapeHtml(plan.signerOverride?.employeeNo || '')}" ${plan.signerOverride ? '' : 'disabled'}></label>`}
+        <div id="detailSignerPicker" class="signer-picker"></div>`}
     </div>
     <div class="edit-actions"><button id="savePlanEdit" class="secondary" type="button">保存设置</button><span id="editStatus" class="muted"></span></div>
     ${offline ? '' : `<dl><dt>费用类型特例</dt><dd>${plan.expenseTypeRules?.length ? escapeHtml(plan.expenseTypeRules.map((rule) => `${rule.keyword}→${rule.type}`).join('、')) : '无'}</dd><dt>票据</dt><dd>${plan.rows.length} 张发票，${plan.uploadFiles.length} 个上传文件（${reviewSource}），分 ${plan.batches.length} 批</dd><dt>检查状态</dt><dd>${plan.cacheState === 'cached' ? '本机取字结果已缓存' : '已读取新增或更新的附件'}。</dd></dl>`}
@@ -805,6 +808,7 @@ function openDetails(folder) {
 function closeDetails() {
   state.detailFolder = '';
   $('detailModal').hidden = true;
+  detailSignerPicker = null;
 }
 
 async function savePlanEdits() {
@@ -814,15 +818,8 @@ async function savePlanEdits() {
   const config = configFor(folder);
   const subject = $('editSubject').value;
   const expenseType = $('editExpenseType')?.value;
-  const signerPicker = $('editSignerName');
-  const customSigner = $('customSignerName');
-  const useDefault = signerPicker?.selectedOptions[0]?.hasAttribute('data-use-default');
-  const signerName = useDefault ? '' : signerPicker?.value || customSigner?.value.normalize('NFKC').trim().replace(/\s+/g, ' ');
-  if (signerPicker && !useDefault && !signerName) {
-    $('editStatus').textContent = '请填写加签人姓名。';
-    customSigner.focus();
-    return;
-  }
+  if (detailSignerPicker && !detailSignerPicker.reportValidity()) return;
+  const signer = detailSignerPicker?.value();
   const payload = { sourceRoot: state.sourceRoot, folder, planId: plan.id, subject };
   if ($('editBookingRoute')) {
     const count = $('editPaperCount');
@@ -834,10 +831,9 @@ async function savePlanEdits() {
     };
   }
   if (expenseType && expenseType !== plan.expenseType) payload.expenseType = expenseType;
-  const signerCode = $('editSignerCode')?.value.trim() || '';
-  if (useDefault && plan.signerOverride) payload.signerOverride = null;
-  if (signerName && (signerName !== plan.signerOverride?.name || signerCode !== (plan.signerOverride?.employeeNo || ''))) {
-    payload.signerOverride = { name: signerName, employeeNo: signerCode };
+  if (signer !== undefined && (signer?.name !== plan.signerOverride?.name ||
+      (signer?.employeeNo || '') !== (plan.signerOverride?.employeeNo || ''))) {
+    payload.signerOverride = signer;
   }
   if (subject === '差旅' && $('editTravelRole')) {
     payload.travelProfile = { role: $('editTravelRole').value, fundType: $('editTravelFund').value };
@@ -848,7 +844,7 @@ async function savePlanEdits() {
   $('editStatus').textContent = '保存中…';
   try {
     const result = await api('/api/plan-override', { method: 'POST', body: JSON.stringify(payload) });
-    if (result.signerNames) state.signerNames = result.signerNames;
+    applySignerRoster(result);
     config.subject = subject;
     const item = itemFor(folder);
     if (item && payload.bookingOptions && item.offlineBooking !== payload.bookingOptions.offline) {
@@ -885,15 +881,11 @@ function renderDetailModal() {
     : `${plan.rows.length} 张发票 · 核定报销 ${money(plan.totalCny)} · ${plan.cacheState === 'cached' ? '复用缓存' : '重新识别'}`;
   $('detailContent').innerHTML = renderPlanDetails(plan);
   $('savePlanEdit')?.addEventListener('click', savePlanEdits);
-  $('editSignerName')?.addEventListener('change', (event) => {
-    const entry = $('customSignerEntry');
-    const code = $('editSignerCode');
-    code.disabled = event.target.selectedOptions[0].hasAttribute('data-use-default');
-    const knownSigner = [plan.signerOverride, plan.signerDefault].find((signer) => signer?.name === event.target.value);
-    code.value = code.disabled ? '' : knownSigner?.employeeNo || '';
-    entry.hidden = Boolean(event.target.value);
-    if (!entry.hidden) $('customSignerName').focus();
-  });
+  const picker = $('detailSignerPicker');
+  detailSignerPicker = picker ? mountSignerPicker(picker, {
+    label: '本笔加签人', roster: state.signerRoster, selected: plan.signerOverride,
+    defaultLabel: `沿用默认（${defaultSignerLabel(plan)}）`,
+  }) : null;
   $('saveMaterials')?.addEventListener('click', saveMaterialReview);
   $('detailModal').hidden = false;
 }
@@ -1681,7 +1673,7 @@ async function refreshFolders(options) {
   state.payrollPositions = result.payrollPositions || [];
   state.payrollExpenseItems = result.payrollExpenseItems || [];
   state.payrollSignerNames = result.payrollSignerNames || {};
-  state.signerNames = result.signerNames || [];
+  applySignerRoster(result);
   renderSchoolFinanceEntry();
   state.folders = (result.claims || []).sort((a, b) => (a.label || a.path).localeCompare(b.label || b.path, 'zh-CN'));
   state.selectedSources = new Set([...state.selectedSources].filter((path) => state.sourceFolders.some((item) => item.path === path && !item.reimbursed && !item.claimKey)));
@@ -1829,18 +1821,25 @@ function toggleSelectAll() {
   renderRows();
 }
 
+let teachingSignerPicker;
+let researchSignerPicker;
 function renderBasicSettings(result) {
   state.workspace = result.workspace ?? null;
   selectConfigStorage(state.workspace);
   state.defaultSourceRoot = result.defaultSourceRoot;
   $('sourceRoot').value = result.sourceRoot;
   $('sourceRoot').readOnly = Boolean(state.workspace);
+  applySignerRoster(result);
+  teachingSignerPicker = mountSignerPicker($('teachingSignerPicker'), {
+    label: '教学备用加签人', roster: state.signerRoster,
+    selected: result.preferences?.signers?.['教学'], defaultLabel: '不设置备用加签人',
+  });
+  researchSignerPicker = mountSignerPicker($('researchSignerPicker'), {
+    label: '科研备用加签人', roster: state.signerRoster,
+    selected: result.preferences?.signers?.['科研'], defaultLabel: '不设置备用加签人',
+  });
   if (result.preferences) {
-    const { signers, campus, autoPrint, smartPaymentLabel, legacyPaymentLabel, researchProjectNos } = result.preferences;
-    $('teachingSigner').value = signers['教学']?.name || '';
-    $('teachingSignerCode').value = signers['教学']?.employeeNo || '';
-    $('researchSigner').value = signers['科研']?.name || '';
-    $('researchSignerCode').value = signers['科研']?.employeeNo || '';
+    const { campus, autoPrint, smartPaymentLabel, legacyPaymentLabel, researchProjectNos } = result.preferences;
     $('bookingCampus').value = campus;
     $('autoPrint').checked = autoPrint;
     $('smartPaymentLabel').value = smartPaymentLabel;
@@ -1949,14 +1948,15 @@ async function saveRoot(demoMode = false) {
     status.textContent = '请填写票据根目录。';
     return;
   }
+  if (!teachingSignerPicker.reportValidity() || !researchSignerPicker.reportValidity()) return;
   $('saveRoot').disabled = true;
   status.textContent = '正在保存基本信息…';
   try {
     await Promise.all([...reasonEntries.values()].filter((entry) => entry.sourceRoot === state.sourceRoot && cleanReason(entry.text) !== entry.saved).map((entry) => saveReasonDraft(entry)));
     const preferences = {
       signers: {
-        教学: { name: $('teachingSigner').value, employeeNo: $('teachingSignerCode').value },
-        科研: { name: $('researchSigner').value, employeeNo: $('researchSignerCode').value },
+        教学: teachingSignerPicker.value(),
+        科研: researchSignerPicker.value(),
       },
       campus: $('bookingCampus').value, autoPrint: $('autoPrint').checked,
       smartPaymentLabel: $('smartPaymentLabel').value, legacyPaymentLabel: $('legacyPaymentLabel').value,
@@ -2095,6 +2095,7 @@ const setReviewArchiveAvailable = bindReviewArchive(api);
 async function refreshSavedClaim(folder, message, focus = true) {
   const saved = await api('/api/folders');
   if (saved.sourceRoot !== state.sourceRoot) return;
+  applySignerRoster(saved);
   const item = saved.claims?.find((entry) => entry.path === folder);
   if (!item) return;
   state.folders = [...state.folders.filter((entry) => entry.path !== folder), item]
@@ -2116,21 +2117,24 @@ const openPayroll = bindPayrollForm({
   api, $, money,
   getContext: () => ({
     sourceRoot: state.sourceRoot, categories: state.payrollCategories, positions: state.payrollPositions,
-    expenseItems: state.payrollExpenseItems, signerNames: state.payrollSignerNames,
+    expenseItems: state.payrollExpenseItems, signerNames: state.payrollSignerNames, signerRoster: state.signerRoster,
   }),
   async onSave(result) {
     await refreshSavedClaim(result.key, '薪酬申报已保存，请在右栏匹配经费。');
   },
 });
 $('addPayroll').addEventListener('click', () => openPayroll().catch((error) => setWorklistStatus(error.message)));
+let projectSignerPicker;
 function openProjectSigner(project) {
   const dialog = $('projectSignerDialog');
   const signer = state.projectSigners[projectNumberKey(project.projectNo)];
   $('projectSignerForm').dataset.projectNo = project.projectNo;
   $('projectSignerForm').dataset.sourceRoot = state.sourceRoot;
   $('projectSignerProject').textContent = [project.projectNo, project.projectName].filter(Boolean).join(' · ');
-  $('projectSignerName').value = signer?.name || '';
-  $('projectSignerCode').value = signer?.employeeNo || '';
+  projectSignerPicker = mountSignerPicker($('projectSignerPicker'), {
+    label: '项目默认加签人', roster: state.signerRoster, selected: signer,
+    defaultLabel: '不设置项目默认加签人',
+  });
   $('projectSignerStatus').textContent = '';
   dialog.showModal();
 }
@@ -2146,11 +2150,12 @@ $('projectSignerForm').addEventListener('submit', async (event) => {
   status.textContent = '正在保存…';
   try {
     const result = await api('/api/project-signer', { method: 'POST', body: JSON.stringify({
-      sourceRoot, projectNo, signer: { name: $('projectSignerName').value, employeeNo: $('projectSignerCode').value },
+      sourceRoot, projectNo, signer: projectSignerPicker.value(),
     }) });
     $('projectSignerDialog').close();
     if (sourceRoot !== state.sourceRoot) return;
     state.projectSigners = result.projectSigners;
+    applySignerRoster(result);
     renderProjects();
     await refreshFolders();
     await autoCheckAll();
@@ -2161,14 +2166,16 @@ $('projectSignerForm').addEventListener('submit', async (event) => {
 });
 
 let editingDidi = null;
+let didiSignerPicker;
 function openDidi(item = null) {
   editingDidi = item;
   $('didiTitle').textContent = item ? '贸大出行详情' : '新增贸大出行';
   $('saveDidi').textContent = item ? '保存详情' : '保存预算';
   $('didiBudget').value = item ? (item.didi.budgetCny / 100).toFixed(2) : '';
-  $('didiSignerName').value = item?.didi.signerOverride?.name || '';
-  $('didiSignerCode').value = item?.didi.signerOverride?.employeeNo || '';
-  $('didiSignerDefault').textContent = item?.match ? defaultSignerLabel(item.didi) : '匹配经费项目后带出默认加签人。';
+  didiSignerPicker = mountSignerPicker($('didiSignerPicker'), {
+    label: '本笔加签人', roster: state.signerRoster, selected: item?.didi.signerOverride,
+    defaultLabel: item?.match ? `沿用默认（${defaultSignerLabel(item.didi)}）` : '沿用默认（匹配项目后带出）',
+  });
   $('didiStatus').textContent = '';
   $('didiDialog').showModal();
 }
@@ -2187,7 +2194,7 @@ $('didiForm').addEventListener('submit', async (event) => {
     const { key } = await api(item ? '/api/didi-claims/' + item.groupId : '/api/didi-claims', {
       method: item ? 'PUT' : 'POST',
       body: JSON.stringify({ sourceRoot, budget: $('didiBudget').value, revision: item?.didi.revision,
-        signerOverride: { name: $('didiSignerName').value, employeeNo: $('didiSignerCode').value },
+        signerOverride: didiSignerPicker.value(),
       }),
     });
     $('didiDialog').close();

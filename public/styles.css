@@ -63,7 +63,10 @@
 .payroll-person legend { color: #526681; font-size: 12px; padding: 0 5px; }
 .payroll-person .edit-grid { margin: 5px 0; }
 .payroll-expense-item[hidden] { display: none; }
-#customSignerEntry[hidden] { display: none; }
+.signer-picker { display: grid; gap: 8px; align-content: start; min-width: 0; }
+.signer-picker label { display: grid; gap: 4px; min-width: 0; color: #526681; font-size: 12px; }
+.signer-picker input, .signer-picker select { width: 100%; }
+.new-signer-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
 .payroll-person button { justify-self: start; align-self: end; }
 .payroll-person-search { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .payroll-person-search .muted { margin: 0; }

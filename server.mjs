@@ -14,7 +14,7 @@ import { didiBudgetCny, validateDidiSelection } from './lib/didi-invoices.mjs';
 import { normalizeModelSettings, publicModelSettings, readModelSettings } from './lib/model-settings.mjs';
 import { documentNumber, fundingSummaryCsv, readFundingExports, readPayrollPeople, summarizeFunding } from './lib/funding-summary.mjs';
 import { DEFAULT_PORT, isInsideDirectory, privateDataDirectory, profileId, receiptDirectory, serviceRevision } from './lib/platform.mjs';
-import { DEFAULT_PREFERENCES, localPreferences, localSigner, projectFunding, resolveClaimSigner } from './lib/local-settings.mjs';
+import { DEFAULT_PREFERENCES, localPreferences, localSigner, projectFunding, resolveClaimSigner, uniqueSigners } from './lib/local-settings.mjs';
 import { createSchoolFundingSync } from './lib/school-funding-sync.mjs';
 import { checkSchoolFinancePage } from './lib/school-finance-access.mjs';
 import { listWebProjects } from './lib/projects.mjs';
@@ -54,6 +54,7 @@ const BATCHES_FILE = join(RUNTIME_DIR, 'batches.json');
 const HISTORY_FILE = join(RUNTIME_DIR, 'history.json');
 const PROJECTS_FILE = join(RUNTIME_DIR, 'projects.json');
 const PROJECT_SIGNERS_FILE = join(RUNTIME_DIR, 'project-signers.json');
+const SIGNER_ROSTER_FILE = join(RUNTIME_DIR, 'signer-roster.json');
 const PROJECT_MATCHES_FILE = join(RUNTIME_DIR, 'project-matches.json');
 const CLAIM_REASONS_FILE = join(RUNTIME_DIR, 'claim-reasons.json');
 const CLAIM_GROUPS_FILE = join(RUNTIME_DIR, 'claim-groups.json');
@@ -210,6 +211,25 @@ try {
     batches.set(batch.id, batch);
   }
 } catch {}
+
+let savedSignerRoster = await readFile(SIGNER_ROSTER_FILE, 'utf8').then(JSON.parse, (error) => {
+  if (error.code === 'ENOENT') return [];
+  throw error;
+});
+if (!Array.isArray(savedSignerRoster)) throw new Error('本机加签人名单格式有误。');
+let signerRoster = uniqueSigners([
+  ...savedSignerRoster,
+  ...Object.values(preferences.signers),
+  ...Object.values(projectSignerDefaults),
+  ...Object.values(memory.signerByClaim).map((record) => record?.signer),
+  ...Object.values(memory.signerByFunding || {}),
+  ...[...claimGroups.values()].flatMap((group) => [group.didi?.signerOverride, group.payroll?.signerOverride]),
+  ...[...plans.values()].map((plan) => plan.signerOverride),
+  ...[...runs.values()].map((run) => run.plan?.signer),
+]);
+const structuredSignerNames = new Set(signerRoster.map(({ name }) => name));
+signerRoster.push(...uniqueSigners(memory.signerNames.map((name) => ({ name })))
+  .filter(({ name }) => !structuredSignerNames.has(name)));
 
 function atomicJson(file, value) {
   const content = JSON.stringify(value, null, 2);
@@ -902,8 +922,14 @@ function projectSigners() {
 }
 
 function availableSignerNames() {
-  const defaults = [...Object.values(preferences.signers), ...Object.values(projectSigners())];
-  return [...new Set([...memory.signerNames, ...defaults.filter(Boolean).map(({ name }) => name)])];
+  return [...new Set([...memory.signerNames, ...signerRoster.map(({ name }) => name)])];
+}
+
+async function rememberSigners(...signers) {
+  const updated = uniqueSigners([...signerRoster, ...signers]);
+  if (isDeepStrictEqual(updated, savedSignerRoster)) return;
+  await atomicJson(SIGNER_ROSTER_FILE, updated);
+  savedSignerRoster = signerRoster = updated;
 }
 
 function claimSignerSettings(projects, fallback, override) {
@@ -951,7 +977,7 @@ function json(response, status, value) {
 
 async function publicConfig() {
   return { demoMode, sourceRoot: liveSourceRoot, defaultSourceRoot: workspace?.sourceRoot ?? DEFAULT_SOURCE_ROOT, workspace: publicWorkspace(workspace),
-    paymentCardConfigured: Boolean(paymentCardLast4), preferences,
+    paymentCardConfigured: Boolean(paymentCardLast4), preferences, signerRoster: demoMode ? [] : signerRoster,
     reviewArchiveAvailable: !demoMode && await hasReviewArchive(REVIEW_ARCHIVE_FILE).catch(() => false) };
 }
 
@@ -1558,6 +1584,7 @@ async function route(request, response) {
       catch (error) { throw httpError(400, error.message); }
       const changed = nextRoot !== SOURCE_ROOT || nextDemo !== demoMode || nextCard !== paymentCardLast4 || !isDeepStrictEqual(nextPreferences, preferences);
       const nextRevision = changed ? randomUUID() : configurationRevision;
+      await rememberSigners(...Object.values(nextPreferences.signers));
       await atomicJson(CONFIG_FILE, { demoMode: nextDemo, sourceRoot: nextDemo ? '' : nextRoot,
         liveSourceRoot: nextDemo ? liveSourceRoot : nextRoot, preferences: nextPreferences,
         paymentCardLast4: nextCard, configurationRevision: nextRevision });
@@ -1582,7 +1609,7 @@ async function route(request, response) {
     return json(response, 200, archive);
   }
   if (request.method === 'GET' && url.pathname === '/api/folders') {
-    if (demoMode) return json(response, 200, { sourceRoot: SOURCE_ROOT, folders: [], claims: [], signerNames: [], payrollCategories: [], payrollPositions: [], payrollExpenseItems: [], payrollSignerNames: {} });
+    if (demoMode) return json(response, 200, { sourceRoot: SOURCE_ROOT, folders: [], claims: [], signerNames: [], signerRoster: [], payrollCategories: [], payrollPositions: [], payrollExpenseItems: [], payrollSignerNames: {} });
     const sourceRoot = SOURCE_ROOT;
     const appointments = schoolBookingsFor(sourceRoot);
     const bySource = new Map(appointments.flatMap((run) => reimbursementSourceFolders(run.plan).map((folder) => [folder, run])));
@@ -1635,7 +1662,7 @@ async function route(request, response) {
         ? { ...folder, label: planLabel(booked.plan), submission: appointmentSummary(booked), withdrawalRunId: booked.id }
         : { ...folder, withdrawalRunId: reimbursements.get(folder.path)?.id };
     }));
-    return json(response, 200, { sourceRoot, claims, signerNames: availableSignerNames(), payrollCategories: PAYROLL_CATEGORIES, payrollPositions: PAYROLL_POSITIONS, payrollExpenseItems: PAYROLL_EXPENSE_ITEMS, payrollSignerNames: payrollSignerNames(preferences.signers), folders: folders.map((folder) => {
+    return json(response, 200, { sourceRoot, claims, signerNames: availableSignerNames(), signerRoster, payrollCategories: PAYROLL_CATEGORIES, payrollPositions: PAYROLL_POSITIONS, payrollExpenseItems: PAYROLL_EXPENSE_ITEMS, payrollSignerNames: payrollSignerNames(preferences.signers), folders: folders.map((folder) => {
       if (folder.reimbursed) return folder;
       const key = projectMatchKey(sourceRoot, folder.path);
       const reason = claimReasons.get(key);
@@ -1721,6 +1748,7 @@ async function route(request, response) {
         id: groupId, key, sourceRoot: SOURCE_ROOT, folders: [], name: '贸大出行', subject: '贸大出行',
         match: null, status: 'draft', fileCount: 0, createdAt: new Date().toISOString(),
       };
+      await rememberSigners(signerOverride);
       await saveGroup({ ...group, didi: { budgetCny, signerOverride }, revision: randomUUID() });
       return json(response, id ? 200 : 201, { id: groupId, key });
     });
@@ -1776,6 +1804,7 @@ async function route(request, response) {
         status: 'draft', fileCount: 0, payroll, revision: randomUUID(),
         createdAt: existing?.createdAt || new Date().toISOString(),
       };
+      await rememberSigners(payroll.signerOverride);
       await saveGroup(group);
       return json(response, id ? 200 : 201, { id: groupId, key });
     });
@@ -1901,11 +1930,12 @@ async function route(request, response) {
         const updated = { ...projectSignerDefaults };
         if (signer) updated[key] = signer;
         else delete updated[key];
+        await rememberSigners(signer);
         await atomicJson(PROJECT_SIGNERS_FILE, updated);
         projectSignerDefaults = updated;
         for (const plan of plans.values()) if (usesProject(plan)) applyPlanSigner(plan);
       }
-      return json(response, 200, { projectSigners: projectSigners() });
+      return json(response, 200, { projectSigners: projectSigners(), signerRoster });
     });
   }
   if (request.method === 'GET' && url.pathname === '/api/funding-summary') {
@@ -2187,6 +2217,7 @@ async function route(request, response) {
         }
       }
       const travelProfile = input.travelProfile?.role ? { role: input.travelProfile.role, fundType: input.travelProfile.fundType === 'research' ? 'research' : 'budget' } : null;
+      if (signer !== undefined) await rememberSigners(signer);
       const changes = await rememberPlanEdit(DATA_APP_DIR, memory, {
         folder,
         folderKey: folderMemoryKey(sourceRoot, folder),
@@ -2205,7 +2236,7 @@ async function route(request, response) {
         }
       }
       if (existing.length || recheck) await savePlans();
-      return json(response, 200, { changes, recheck, signerNames: availableSignerNames(), plan: !recheck && latest ? publicPlan(latest) : null });
+      return json(response, 200, { changes, recheck, signerNames: availableSignerNames(), signerRoster, plan: !recheck && latest ? publicPlan(latest) : null });
     }));
   }
   if (request.method === 'GET' && url.pathname === '/api/batches') {

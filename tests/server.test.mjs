@@ -1208,6 +1208,53 @@ test('conflicting project signers require a claim override and clearing it resto
   assert.equal(fallback.signer.name, '示例教学加签人');
 });
 
+test('the shared signer roster retains historical names and newly saved signers after clearing assignments', async (t) => {
+  const app = await setup(t);
+  const sourceRoot = app.sourceRoot;
+  const legacyName = '旧名单测试人';
+  const remembered = { name: '历史事项测试人', employeeNo: 'TEST-701' };
+  const sameName = { name: remembered.name, employeeNo: 'TEST-702' };
+  await app.stop();
+  await writeFile(join(app.appDir, '.runtime/memory.json'), JSON.stringify({
+    signerNames: [legacyName, remembered.name],
+    signerByClaim: { 'historical-fixture': { signer: remembered } },
+  }));
+  await app.start();
+  const readRoster = async () => (await app.request('/api/folders')).body.signerRoster;
+  const initial = await readRoster();
+  assert.deepEqual(initial.filter(({ name }) => name === remembered.name), [remembered]);
+  assert.ok(initial.some(({ name, employeeNo }) => name === legacyName && employeeNo === ''));
+  assert.ok(initial.some(({ name }) => name === '示例教学加签人'));
+
+  const project = { projectNo: 'TEST-2026-01', projectName: '模拟经费' };
+  const saveDefault = (signer) => app.request('/api/project-signer', { sourceRoot, projectNo: project.projectNo, signer });
+  assert.equal((await saveDefault({ name: '', employeeNo: 'TEST-703' })).status, 400);
+  assert.equal((await saveDefault(sameName)).status, 200);
+  const projectSigner = { name: '无工号项目测试人', employeeNo: '' };
+  assert.equal((await saveDefault(projectSigner)).status, 200);
+  const claim = await app.request('/api/didi-claims', { sourceRoot, budget: '10.00' });
+  await matchClaimProject(app, claim.body.key, project);
+  const didi = async () => (await app.request('/api/folders')).body.claims.find(({ path }) => path === claim.body.key).didi;
+  const updateDidiSigner = async (signerOverride) => app.request('/api/didi-claims/' + claim.body.id, {
+    sourceRoot, budget: '10.00', revision: (await didi()).revision, signerOverride,
+  }, 'PUT');
+  assert.deepEqual((await didi()).signer, projectSigner);
+  const claimSigner = { name: '单笔新增测试人', employeeNo: 'TEST-704' };
+  assert.equal((await updateDidiSigner(claimSigner)).status, 200);
+  assert.deepEqual((await didi()).signer, claimSigner);
+  assert.equal((await updateDidiSigner(null)).status, 200);
+  assert.deepEqual((await didi()).signer, projectSigner);
+  assert.equal((await saveDefault(null)).status, 200);
+  await app.stop();
+  await app.start();
+  const reloaded = await readRoster();
+  for (const signer of [remembered, sameName, projectSigner, claimSigner]) {
+    assert.deepEqual(reloaded.filter((item) => item.name === signer.name && item.employeeNo === signer.employeeNo), [signer]);
+  }
+  assert.deepEqual((await app.request('/api/config')).body.signerRoster, reloaded);
+  assert.equal((await didi()).signerDefaultSource, 'funding');
+});
+
 test('an explicit project match survives restart before any plan is generated', async (t) => {
   const app = await setup(t);
   const match = { projectNo: 'TEST-2026-01', projectName: '测试项目', funding: '科研' };
