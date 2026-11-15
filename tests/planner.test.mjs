@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cp, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, rmdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { createPlan, fingerprintFolder, validatePlanForExecution } from '../lib/planner.mjs';
+import { archiveReceiptFolder, createPlan, fingerprintFolder, validatePlanForExecution } from '../lib/planner.mjs';
 import { confirmClaimPurpose } from '../lib/claim-purpose.mjs';
 import { cachedFixture, concretePurpose } from './fixtures.mjs';
 
@@ -15,6 +15,18 @@ async function addSource(t, input, options) {
   await cp(join(second.appDir, '.runtime/cache', encodeURIComponent(second.folder)), join(input.appDir, '.runtime/cache', encodeURIComponent(second.folder)), { recursive: true });
   return second.folder;
 }
+
+test('archiving renames the original folder once and never replaces a conflicting directory', async (t) => {
+  const { sourceRoot, folder, fingerprint } = await cachedFixture(t);
+  const archive = folder + '-已报销';
+  await mkdir(join(sourceRoot, archive));
+  await assert.rejects(archiveReceiptFolder(sourceRoot, folder, fingerprint), /名称已被占用/);
+  assert.equal((await fingerprintFolder(sourceRoot, folder)).fingerprint, fingerprint);
+  await rmdir(join(sourceRoot, archive));
+  assert.equal(await archiveReceiptFolder(sourceRoot, folder, fingerprint), archive);
+  assert.equal(await archiveReceiptFolder(sourceRoot, folder, fingerprint), archive);
+  assert.equal((await fingerprintFolder(sourceRoot, archive)).fingerprint, fingerprint);
+});
 
 test('one grouped plan reconciles all sources and preserves same-named attachment provenance', async (t) => {
   const input = await cachedFixture(t);

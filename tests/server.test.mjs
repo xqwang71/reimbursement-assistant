@@ -987,7 +987,7 @@ test('three-project allocations persist and a changed share invalidates the old 
   assert.match(zero.blockers.join(' '), /最后一个项目/);
 });
 
-test('restart repairs a submitted matter when only its first source was archived', async (t) => {
+test('restart repairs a submitted matter whose sources were marked but not all renamed', async (t) => {
   const app = await setup(t);
   const second = await addSourceFixture(t, app);
   const group = (await app.request('/api/claim-groups', { sourceRoot: app.sourceRoot, folders: [app.folder, second], subject: 'AI服务' })).body.group;
@@ -999,7 +999,7 @@ test('restart repairs a submitted matter when only its first source was archived
   await writeFile(join(app.appDir, '.runtime/runs.json'), JSON.stringify([{
     id: '99999999-9999-4999-8999-999999999999', plan, sourceRoot: app.sourceRoot,
     control: { progress: { uploads: [], submission: { state: 'verified', financeFormId: 'TEST-SCHOOL-456', verifiedAt: new Date().toISOString() } } },
-    events: [], messages: [], status: 'completed', bookkeeping: {},
+    events: [], messages: [], status: 'completed', bookkeeping: { historyRecorded: true, folderMarked: true },
   }]));
   await app.start();
   const archived = (await app.request('/api/folders')).body.claims.find((item) => item.groupId === group.id);
@@ -1321,6 +1321,7 @@ test('different invoices cannot reuse the same transaction in a batch or after v
   await app.stop();
   const storedPlans = JSON.parse(await readFile(join(app.appDir, '.runtime/plans.json'), 'utf8'));
   const runId = '11111111-1111-4111-8111-111111111111';
+  const batchId = '22222222-2222-4222-8222-222222222222';
   await writeFile(join(app.appDir, '.runtime/runs.json'), JSON.stringify([{
     id: runId,
     plan: storedPlans.find((plan) => plan.id === firstPlan.id),
@@ -1328,10 +1329,16 @@ test('different invoices cannot reuse the same transaction in a batch or after v
     events: [],
     messages: [],
   }]));
+  await writeFile(join(app.appDir, '.runtime/batches.json'), JSON.stringify([{
+    id: batchId, runIds: [runId], currentRunId: runId, currentIndex: 0, status: 'preview',
+  }]));
   await app.start();
   const resolved = await app.request(`/api/runs/${runId}/resolution`, { confirmed: true, resolution: 'submitted', financeFormId: 'TEST-DOC-001' });
   assert.equal(resolved.status, 200, JSON.stringify(resolved.body));
   assert.equal(resolved.body.run.status, 'completed');
+  const batch = (await app.request('/api/batches')).body.batches.find((item) => item.id === batchId);
+  assert.equal(batch.status, 'completed');
+  assert.equal(batch.currentRunId, null);
   await app.stop();
   await app.start();
   const duplicate = await app.request('/api/runs', { planId: secondPlan.id });

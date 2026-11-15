@@ -4,7 +4,7 @@ import { basename, join, resolve, dirname, extname, posix } from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { listFinalFolders, isReimbursedFolder, createPlan, publicPlan, PLAN_VERSION, SUBJECTS, validatePlanForExecution, fingerprintFolder, fingerprintPlan } from './lib/planner.mjs';
+import { listFinalFolders, isReimbursedFolder, createPlan, publicPlan, PLAN_VERSION, SUBJECTS, validatePlanForExecution, fingerprintPlan, archiveReceiptFolder } from './lib/planner.mjs';
 import { confirmClaimPurpose, normalizeClaimReason } from './lib/claim-purpose.mjs';
 import { claimWithdrawalFor, markClaimWithdrawn, reimbursementSourceFolders } from './lib/claim-withdrawal.mjs';
 import { ReimbursementExecutor } from './lib/executor.mjs';
@@ -807,17 +807,17 @@ async function recordSubmitted(run) {
     return;
   }
   try {
-    const external = [...annualSources.values()].some(({ sourceRoot }) => sourceRoot === run.sourceRoot);
-    const reimbursedFolder = external ? reimbursementSourceFolders(run.plan).join('、') : await markFolderReimbursed(run.plan, run.sourceRoot);
-    run.bookkeeping.folderMarked = true;
-    delete run.bookkeeping.renameError;
-    run.events.push({ type: 'step', step: '标记已报销', status: 'completed', detail: reimbursedFolder, at: new Date().toISOString() });
-    addMessage(run, 'assistant', run.plan.groupId ? `已核实“${planLabel(run.plan)}”提交结果，${run.plan.sourceFolders.length} 个来源文件夹已归入报销历史。` : `已核实本单提交结果，文件夹已标记为“${reimbursedFolder}”。`);
-    if (!external && run.plan.groupId) await withWorklistWrite(async () => {
+    const reimbursedFolder = await markFolderReimbursed(run.plan, run.sourceRoot);
+    if (run.plan.groupId) await withWorklistWrite(async () => {
       const group = claimGroupFor(run.sourceRoot, run.plan.folder);
       await saveGroup({ ...group, archivedFolders: run.plan.archivedFolders });
     });
+    run.bookkeeping.folderMarked = true;
+    delete run.bookkeeping.renameError;
+    run.events.push({ type: 'step', step: '标记已报销', status: 'completed', detail: reimbursedFolder, at: new Date().toISOString() });
+    addMessage(run, 'assistant', run.plan.groupId ? `已核实“${planLabel(run.plan)}”提交结果，${run.plan.sourceFolders.length} 个来源文件夹已在原目录加上「-已报销」。` : `已核实本单提交结果，文件夹已标记为“${reimbursedFolder}”。`);
   } catch (error) {
+    run.bookkeeping.folderMarked = false;
     run.bookkeeping.renameError = error.message;
     addMessage(run, 'assistant', `本单已核实提交，发票已记入防重复记录；文件夹暂未改名：${error.message}。请核对后手动整理文件夹。`);
   }
@@ -1026,27 +1026,27 @@ async function markFolderReimbursed(plan, sourceRoot) {
   if (plan.sourceFolders) {
     plan.archivedFolders = [];
     for (const source of plan.sources) {
-      plan.archivedFolders.push(await markFolderReimbursed({ folder: source.folder, fingerprint: source.fingerprint }, sourceRoot));
+      plan.archivedFolders.push(await archiveReceiptFolder(sourceRoot, source.folder, source.fingerprint));
       await saveRuns();
     }
     return plan.archivedFolders.join('、');
   }
-  if (plan.folder.endsWith('-已报销')) return plan.folder;
-  const source = resolve(sourceRoot, plan.folder);
-  const targetFolder = `${plan.folder}-已报销`;
-  const target = resolve(sourceRoot, targetFolder);
-  if (!isInsideDirectory(sourceRoot, source) || !isInsideDirectory(sourceRoot, target)) throw new Error('报销文件夹路径无效');
-  try {
-    const current = await fingerprintFolder(sourceRoot, plan.folder);
-    if (current.fingerprint !== plan.fingerprint) throw new Error('提交后附件已变化，需人工整理本批文件夹');
-    await rename(source, target);
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    const marked = await fingerprintFolder(sourceRoot, targetFolder);
-    if (marked.fingerprint !== plan.fingerprint) throw new Error('已报销文件夹与本任务附件不一致，需人工核对');
-  }
-  plan.folder = targetFolder;
-  return targetFolder;
+  plan.folder = await archiveReceiptFolder(sourceRoot, plan.folder, plan.fingerprint);
+  return plan.folder;
+}
+
+function hasArchivedFolders(plan) {
+  if (plan.didi) return true;
+  if (!plan.sourceFolders) return plan.folder.endsWith('-已报销');
+  return plan.sourceFolders.every((folder) => plan.archivedFolders?.includes(`${folder}-已报销`));
+}
+
+function markVerifiedBatchComplete(batch) {
+  if (!batch.currentRunId || !batch.runIds.every((id) => runs.get(id)?.status === 'completed')) return;
+  batch.status = 'completed';
+  batch.currentRunId = null;
+  batch.error = null;
+  batch.updatedAt = new Date().toISOString();
 }
 
 function createRun(plan) {
@@ -2262,11 +2262,16 @@ async function route(request, response) {
       if (input.resolution === 'submitted') {
         const financeFormId = String(input.financeFormId || '').trim();
         if (!/^[A-Za-z0-9-]{6,40}$/.test(financeFormId)) throw httpError(400, '请填写已核实提交成功的学校报销单号');
+        if ([...runs.values()].some((other) => other.id !== run.id && other.control.progress.submission.state === 'verified' &&
+            other.control.progress.submission.financeFormId === financeFormId && !claimWithdrawalFor(history, other.id))) {
+          throw httpError(409, '这一学校报销单号已登记，请核对当前任务的单号');
+        }
         run.control.progress.submission = { state: 'verified', source: 'user_verified', financeFormId, verifiedAt: new Date().toISOString() };
         await saveRuns();
         await recordSubmitted(run);
         run.status = 'completed';
         run.result = 'submitted';
+        for (const batch of batches.values()) if (batch.currentRunId === run.id) markVerifiedBatchComplete(batch);
       } else if (input.resolution === 'not_submitted') {
         run.control.progress.submission = { state: 'not_started' };
         run.control.cancelled = false;
@@ -2544,11 +2549,13 @@ await atomicJson(CONFIG_FILE, { demoMode, sourceRoot: demoMode ? '' : SOURCE_ROO
 if (importedReasons) await atomicJson(CLAIM_REASONS_FILE, [...claimReasons]);
 for (const run of runs.values()) {
   const marked = run.plan.payrollRevision ? run.bookkeeping?.payrollRecorded
-    : run.plan.reimbursementRoute === 'legacy' ? run.bookkeeping?.appointmentRecorded : run.bookkeeping?.folderMarked;
+    : run.plan.reimbursementRoute === 'legacy' ? run.bookkeeping?.appointmentRecorded
+      : run.bookkeeping?.folderMarked && hasArchivedFolders(run.plan);
   if (run.control.progress.submission.state === 'verified' && (!run.bookkeeping?.historyRecorded || !marked)) {
     try { await recordSubmitted(run); } catch (error) { run.status = 'verification_required'; run.error = `已核实提交，本地登记尚未完成：${error.message}`; }
   }
 }
+for (const batch of batches.values()) markVerifiedBatchComplete(batch);
 await saveRuns();
 
 export function handleRequest(request, response) {

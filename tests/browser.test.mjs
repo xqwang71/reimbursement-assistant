@@ -1944,7 +1944,51 @@ test('automatic submission records the signer click first and settles on the mat
   assert.equal(await instance.schoolSubmissionReceipt(), null);
 });
 
-test('the late confirmation after school pre-review is accepted once and verified by its receipt', async (t) => {
+test('a split payment uses the school fill action and waits until the school advances', async (t) => {
+  const { instance, frame, plan } = await setup(t, 'detail');
+  Object.assign(plan, {
+    totalCny: 10000, paidTotalCny: 10000,
+    projectAllocationDraft: projectFixture.map((project, index) => ({ ...project, amountCny: index === 0 ? 6000 : null })),
+  });
+  instance.paymentAdvanceTimeoutMs = 1600;
+  await frame.evaluate((type) => {
+    const app = document.querySelector('#app');
+    app.innerHTML = `<section class="part-box"><h2>支付信息</h2><button>添加支付类型</button><p>${type}</p>
+      <input placeholder="请输入金额"><button id="fill-all">全部填入</button><p id="remaining">待支付金额：￥100.00</p>
+      <button id="save-payment">保存并下一步</button></section>`;
+    const amount = app.querySelector('input');
+    const left = app.querySelector('#remaining');
+    window.schoolFillCount = 0;
+    window.paymentSaveCount = 0;
+    window.schoolCanSavePayment = false;
+    let schoolAmount = '0.00';
+    const renderAmount = () => { left.textContent = `待支付金额：￥${(100 - Number(amount.value)).toFixed(2)}`; };
+    amount.oninput = renderAmount;
+    app.querySelector('#fill-all').onclick = () => {
+      window.schoolFillCount += 1;
+      schoolAmount = '100.00';
+      amount.value = schoolAmount;
+      renderAmount();
+    };
+    app.querySelector('#save-payment').onclick = () => {
+      window.paymentSaveCount += 1;
+      if (!window.schoolCanSavePayment || schoolAmount !== '100.00') {
+        amount.value = '';
+        renderAmount();
+        return;
+      }
+      app.insertAdjacentHTML('beforeend', '<div class="el-dialog"><h2>确认提交报销单</h2><button>提交预审</button></div>');
+    };
+  }, plan.paymentType);
+  await assert.rejects(instance.fillPayment(), /学校仍显示待支付 100\.00 元/);
+  assert.equal(instance.progress.paymentVerified, false);
+  await frame.evaluate(() => { window.schoolCanSavePayment = true; });
+  assert.equal(await instance.fillPayment(), 'confirm');
+  assert.equal(instance.progress.paymentVerified, true);
+  assert.deepEqual(await frame.evaluate(() => [window.schoolFillCount, window.paymentSaveCount]), [2, 2]);
+});
+
+test('the late confirmation on the school pre-review page is accepted once and verified by its receipt', async (t) => {
   const { instance, page, frame, plan } = await setup(t, 'signer');
   instance.progress.uploadPageId = await browserTargetId(page);
   instance.progress.fillingId = 'fixture-draft-002';
@@ -1958,6 +2002,7 @@ test('the late confirmation after school pre-review is accepted once and verifie
       event.stopPropagation();
       window.signerClicks = (window.signerClicks || 0) + 1;
       setTimeout(() => {
+        history.replaceState(null, '', '/ClaimsPublicPCWeb/preliminaryExamination?code=FIXTURE-0010');
         const app = document.getElementById('app');
         app.innerHTML = `<p>报销单号：DOC-000001</p><p>${projectNo} 示例教学加签人 980001</p><p>报销金额：90.00</p>
           <input placeholder="请输入用途"><div class="el-dialog"><h2>确认提交报销单</h2><button>提交预审</button></div>`;
@@ -1987,6 +2032,7 @@ test('the late confirmation after school pre-review is accepted once and verifie
   };
   assert.equal(await instance.confirmAndFinish(await instance.addSigner()), 'submitted');
   assert.equal(instance.progress.submission.financeFormId, 'FIXTURE-0010');
+  assert.equal(instance.progress.preReviewFinanceFormId, 'FIXTURE-0010');
   assert.equal(instance.progress.submission.action, 'confirm_pre_review');
   assert.deepEqual(await frame.evaluate(() => [window.signerClicks, window.finalSubmitClicks, window.followupClicks]), [1, 1, 1]);
 });
