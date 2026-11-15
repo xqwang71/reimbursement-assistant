@@ -1477,6 +1477,63 @@ test('different invoices cannot reuse the same transaction in a batch or after v
   await assert.rejects(access(app.started));
 });
 
+test('a manually recorded receipt lets the original batch continue from the next untouched claim', async (t) => {
+  const app = await setup(t, { previewExecution: true });
+  const secondFolder = await addSourceFixture(t, app);
+  const thirdFolder = await addSourceFixture(t, app, {
+    folder: 'third', invoiceNumber: '12345678901234567892', orderNumber: '2234567890123457', paymentId: 'PAY-0003',
+  });
+  const plans = [await app.plan(), await app.plan(secondFolder), await app.plan(thirdFolder)];
+  const started = await app.request('/api/batch-runs', { planIds: plans.map(({ id }) => id) });
+  assert.equal(started.status, 202, JSON.stringify(started.body));
+  const { id: batchId, runs: originalRuns } = started.body.batch;
+  const [first, second] = originalRuns;
+  const readBatch = async () => (await app.request(`/api/batches/${batchId}`)).body.batch;
+  const waitForBatch = async (condition) => {
+    const deadline = Date.now() + 4000;
+    do {
+      const batch = await readBatch();
+      if (condition(batch)) return batch;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } while (Date.now() < deadline);
+    assert.fail('batch did not reach its expected stage');
+  };
+  const instruct = (run, message) => app.request(`/api/runs/${run.id}/instructions`, { message });
+
+  await waitForBatch((batch) => batch.runs[0].pendingKind === 'final_approval');
+  assert.equal((await instruct(first, '先别提交')).status, 200);
+  await waitForBatch((batch) => batch.status === 'preview');
+  const verified = await app.request(`/api/runs/${first.id}/resolution`, {
+    confirmed: true, resolution: 'submitted', financeFormId: 'TEST-MANUAL-001',
+  });
+  assert.equal(verified.status, 200, JSON.stringify(verified.body));
+  assert.match(verified.body.run.messages.at(-1).text, /回复「继续」.*剩余报销/);
+  const paused = await readBatch();
+  assert.equal(paused.status, 'paused');
+  assert.deepEqual(paused.runs.map(({ status }) => status), ['completed', 'stopped', 'stopped']);
+  assert.ok(paused.runs.slice(1).every(({ events }) => events.length === 0));
+
+  await app.stop();
+  const file = join(app.appDir, '.runtime/batches.json');
+  const saved = JSON.parse(await readFile(file, 'utf8'));
+  saved.find((batch) => batch.id === batchId).status = 'error';
+  await writeFile(file, JSON.stringify(saved));
+  await app.start();
+  assert.equal((await readBatch()).status, 'paused');
+  const continued = await instruct(first, '继续');
+  assert.equal(continued.status, 202, JSON.stringify(continued.body));
+  assert.equal(continued.body.batch.id, batchId);
+  assert.equal(continued.body.batch.currentRunId, second.id);
+  const waiting = await waitForBatch((batch) => batch.runs[1].pendingKind === 'final_approval');
+  assert.deepEqual(waiting.runs.map(({ id }) => id), originalRuns.map(({ id }) => id));
+  assert.deepEqual(waiting.runs.map(({ status }) => status), ['completed', 'waiting_input', 'queued']);
+  assert.equal((await instruct(first, '继续')).status, 200);
+  assert.equal((await app.request('/api/batches')).body.batches.length, 1);
+  assert.equal((await app.request('/api/runs')).body.runs.length, 3);
+  assert.equal((await instruct(second, '先别提交')).status, 200);
+  await waitForBatch((batch) => batch.status === 'preview');
+});
+
 test('a submission attempt remains blocked after restart and ordinary cancellation', async (t) => {
   const app = await setup(t);
   const plan = await app.plan();

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ReimbursementExecutor } from '../lib/executor.mjs';
+import { didiInvoiceWindow } from '../lib/didi-invoices.mjs';
 
 const executor = (options = {}) => new ReimbursementExecutor({ plan: {}, appDir: '/private/tmp', onEvent() {}, ask: async () => '', ...options });
 
@@ -35,6 +36,16 @@ test('a recorded ambiguous submission never clicks the submit button on resume',
   instance.run = ReimbursementExecutor.prototype.run.bind(instance);
   assert.equal(await instance.run(), 'verification_required');
   assert.equal(opened, 0);
+});
+
+test('Didi checks the invoice year before resuming a draft or submitting for pre-review', async () => {
+  const { firstYear } = didiInvoiceWindow();
+  const instance = executor({ plan: { didi: { budgetCny: 10000 }, rows: [{ date: `${firstYear - 1}-12-31` }] }, resumeStages: true });
+  instance.openPlatform = async () => {};
+  instance.detectStage = async () => assert.fail('an expired invoice must be stopped before filling');
+  await assert.rejects(instance.run(), /滴滴发票开票日期.*超出报销年度/);
+  await assert.rejects(instance.submitPreReview(), /滴滴发票开票日期.*超出报销年度/);
+  assert.equal(instance.progress.submission.state, 'not_started');
 });
 
 test('discounted invoice verification reads the live input rather than its invoice limit suffix', async () => {
