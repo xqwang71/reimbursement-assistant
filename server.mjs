@@ -1364,6 +1364,7 @@ async function executeRun(run) {
     appDir: DATA_APP_DIR,
     control: run.control,
     resumeStages: run.control.resumeStages === true,
+    previousRuns: [...runs.values()].filter((previous) => previous.id !== run.id),
     validate: () => validateRun(run),
     onProgress: () => saveRuns(),
     getSubmittedInvoices: () => history.submittedInvoiceNumbers,
