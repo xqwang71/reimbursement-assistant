@@ -58,6 +58,23 @@ test('discounted invoice verification reads the live input rather than its invoi
   assert.equal(instance.progress.detailVerified, true);
 });
 
+test('a discount can remain unallocated only when it equals the verified invoice balance', async () => {
+  const instance = executor({ plan: { totalCny: 9000, invoiceTotalCny: 10000, rows: [
+    { invoiceNumber: '12345678901234567890', reimbursementAmountCny: 9000, invoiceAmountCny: 10000 },
+  ] } });
+  instance.bodyText = async () => '12345678901234567890';
+  instance.detailAmountSnapshot = async () => ({
+    rows: [{ invoiceNumber: '12345678901234567890', amountCny: 9000 }], availableCny: 10000, remainingCny: 1000,
+  });
+  await instance.verifyDetailAmounts();
+  assert.equal(instance.progress.detailVerified, true);
+  for (const snapshot of [
+    { availableCny: 10000, remainingCny: 900 },
+    { availableCny: 9900, remainingCny: 900 },
+    { availableCny: null, remainingCny: 1000 },
+  ]) assert.equal(instance.detailRemainingMatches(snapshot), false);
+});
+
 test('equal grand totals do not excuse wrong per-invoice reimbursement amounts', async () => {
   const instance = executor({ plan: { totalCny: 19000, rows: [{ invoiceNumber: '12345678901234567890', reimbursementAmountCny: 9000 }, { invoiceNumber: '12345678901234567891', reimbursementAmountCny: 10000 }] } });
   instance.bodyText = async () => '金额\n80.00/80.00\n金额\n110.00/110.00\n待分配金额：0.00';
@@ -86,6 +103,7 @@ test('rechecking a wrong invoice breakdown keeps the run waiting until the break
   await instance.verifyDetailAmounts();
   assert.equal(replies.length, 2);
   assert.match(replies[0], /第 1 张应报 90.00 元，学校显示 80.00 元/);
+  assert.match(replies[0], /学校费用明细合计 190.00 元/);
   assert.equal(instance.progress.detailVerified, true);
 });
 
