@@ -1880,6 +1880,52 @@ test('a grouped school detail uses the verified original upload and binds its dr
   await assert.rejects(instance.assertDocumentIdentity(), /草稿已变化/);
 });
 
+test('a discounted grouped detail is filled on the verified draft and reconciles its unclaimed balance', async (t) => {
+  const { instance, frame, page, plan } = await setup(t, 'detail');
+  const files = ['发票.pdf', '银行扣款.png', '优惠账单.png'];
+  plan.uploadFiles = files.map((name) => ({ name }));
+  plan.rows[0].invoiceFile = files[0];
+  instance.progress = instance.control.progress = {
+    ownedDocument: true, uploadPageId: await browserTargetId(page),
+    uploads: [{ state: 'verified', files, proof: {
+      schoolReceipt: { invoiceCount: 1, attachmentCount: 2, invoiceTotalCny: 10000 },
+    } }], submission: { state: 'not_started' },
+  };
+  await frame.evaluate(({ reason, projectNo }) => {
+    history.replaceState(null, '', '/ClaimsPublicPCWeb/filling?id=fixture-discount-draft');
+    document.querySelector('#app > p').textContent = projectNo;
+    document.querySelector('section').innerHTML = `<h2>报销支出费用明细</h2>
+      <div class="el-collapse-item"><div class="detail">
+        <input placeholder="请输入金额" value="100.00"><input placeholder="请输入用途">
+      </div></div><p class="allocate-money">待分配金额：￥0.00</p><p class="total-money">可分配报销金额：￥100.00</p>`;
+    document.querySelector('[placeholder="请输入用途"]').value = reason;
+    document.querySelector('[placeholder="请输入金额"]').addEventListener('input', (event) => {
+      const remaining = 100 - Number(event.target.value);
+      document.querySelector('.allocate-money').textContent = '待分配金额：￥' + remaining.toFixed(2);
+    });
+  }, { reason: plan.reason, projectNo: plan.project.projectNo });
+  const amount = frame.getByPlaceholder('请输入金额', { exact: true }).first();
+  const receipt = instance.progress.uploads[0].proof.schoolReceipt;
+  instance.progress.uploads[0].proof.schoolReceipt = { ...receipt, attachmentCount: 1 };
+  await assert.rejects(instance.adjustExpenseAmounts(), /附件核验记录/);
+  assert.equal(await amount.inputValue(), '100.00');
+  instance.progress.uploads[0].proof.schoolReceipt = receipt;
+  instance.progress.fillingId = 'fixture-other-draft';
+  await assert.rejects(instance.adjustExpenseAmounts(), /草稿已变化/);
+  assert.equal(await amount.inputValue(), '100.00');
+  delete instance.progress.fillingId;
+  await instance.adjustExpenseAmounts();
+  assert.equal(await amount.inputValue(), '90.00');
+  assert.equal((await instance.detailAmountSnapshot()).remainingCny, 1000);
+  instance.ask = async () => { throw Error('Unexpected amount review'); };
+  await instance.verifyDetailAmounts();
+  assert.equal(instance.progress.detailVerified, true);
+  assert.equal(instance.progress.fillingId, 'fixture-discount-draft');
+  await amount.fill('100.00');
+  await assert.rejects(instance.verifyDetailAmounts(), /Unexpected amount review/);
+  assert.equal(instance.progress.detailVerified, false);
+});
+
 test('a school-truncated grouped purpose is shown for approval and rechecked before submission', async (t) => {
   const { instance, frame, page, plan } = await setup(t, 'detail');
   plan.reason = '模拟实验课程演示软件许可费';
