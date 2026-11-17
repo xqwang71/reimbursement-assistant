@@ -198,6 +198,70 @@ test('a matching bank consumption debit proves payment without separate posting 
   }
 });
 
+const walletBill = (orderId) => [
+  '账单详情', '-757.50', '交易成功', '订单金额', '760.00', '银行立减', '-2.50',
+  '支付时间', '2026-07-08 11:23:44', '付款方式', '示例银行信用卡(8765)',
+  '收款方全称', '**客户(个人)', '订单号', orderId, '商家订单号', '00000000000000011111',
+].join('\n');
+
+test('copies of a settled wallet bill use its payment order number', () => {
+  const sample = '2026070823001111000000000001';
+  const first = payment(1, 75750, { transactionId: null, date: '2026-07-08', text: walletBill(sample) });
+  const second = payment(2, 75750, { transactionId: null, date: first.date, text: walletBill(sample) });
+  const matches = { '发票1.pdf': link(null, first.file.name, second.file.name) };
+  const result = assess([invoice(1, 76000), first, second], { selection: { matches } });
+  assert.equal(result.totalCny, 75750);
+  assert.equal(result.paidTotalCny, 75750);
+  assert.equal(result.paymentCandidates.length, 1);
+  assert.ok(result.paymentKeys.includes('file:sha-支付2.png'));
+  assert.ok(result.paymentKeys.some((key) => key.startsWith('transaction:')));
+
+  second.text = walletBill('2026070823001111000000000002');
+  const unrelated = assess([invoice(1, 76000), first, second], { selection: { matches } });
+  assert.equal(unrelated.paymentCandidates.length, 2);
+  assert.equal(unrelated.status, 'blocked');
+});
+
+test('the wallet discount and bank debit both stay attached to one verified payment', () => {
+  const wallet = payment(1, 75750, { transactionId: null, date: '2026-07-08', text: walletBill('2026070823001111000000000001') });
+  const text = [
+    '收支详情', '-757.50', '交易卡号', '1234****8765', '交易时间', '2026-07-08',
+    '业务摘要', '消费', '交易场所', '支付宝-示例客户', '交易金额', '757.50', '记账币种', '人民币',
+  ].join('\n');
+  const bank = payment(2, 75750, { date: wallet.date, text });
+  const matches = { '发票1.pdf': link(null, wallet.file.name, bank.file.name) };
+  for (const paymentFiles of [matches['发票1.pdf'].payment, [wallet.file.name], [bank.file.name]]) {
+    const result = assess([invoice(1, 76000), wallet, bank], {
+      selection: { matches: { '发票1.pdf': link(null, ...paymentFiles) } },
+    });
+    assert.equal(result.status, 'ready');
+    assert.equal(result.paidTotalCny, 75750);
+    assert.equal(result.totalCny, 75750);
+    assert.equal(result.paymentCandidates.length, 1);
+    assert.ok(result.paymentKeys.includes('file:sha-支付2.png'));
+    assert.ok(result.uploadNames.includes(wallet.file.name));
+    assert.ok(result.uploadNames.includes(bank.file.name));
+    assert.match(result.warnings.join(' '), /银行立减 2\.50 元/);
+  }
+
+  const wrongDiscount = { ...wallet, text: wallet.text.replace('-2.50', '-1.50') };
+  assert.equal(assess([invoice(1, 76000), wrongDiscount, bank], { selection: { matches } }).paymentCandidates.length, 2);
+
+  for (const changed of [
+    text.replace('8765', '1111'), text.replace('示例客户', '测试商家'),
+    text.replace('支付宝', '微信支付'), text.replace('2026-07-08', '2026-07-08 12:34:56'),
+  ]) {
+    const unrelated = assess([invoice(1, 76000), wallet, { ...bank, text: changed }], { selection: { matches } });
+    assert.equal(unrelated.paymentCandidates.length, 2);
+    assert.equal(unrelated.status, 'blocked');
+  }
+
+  const other = payment(3, 75750, { date: wallet.date, text });
+  const ambiguous = assess([invoice(1, 76000), wallet, bank, other], { selection: { matches } });
+  assert.equal(ambiguous.paymentCandidates.length, 3);
+  assert.equal(ambiguous.status, 'blocked');
+});
+
 test('JD and bank receipts for the same card, amount and second count once', () => {
   const jd = payment(1, 10000, { text: '京东钱包\n账单详情\n-100.00\n交易成功\n支付方式\n工商银行信用卡(1234)\n创建时间\n2026-07-0810:03:15' });
   const bank = payment(2, 10000, { text: bankReceipt });
