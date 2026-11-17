@@ -1343,6 +1343,52 @@ test('manual payment links validate the evidence and survive rechecking unchange
   assert.equal(rechecked.status, 'blocked');
 });
 
+test('both proofs of a bank discount stay in the upload plan after saving material confirmations', async (t) => {
+  const bank = '银行扣款.png';
+  const app = await setup(t, {
+    invoice: 15000, payment: 14735,
+    paymentNote: [
+      '账单详情', '订单金额', '150.00', '银行立减', '-2.65', '收款方全称', '**货商(个人)',
+      '订单号', '2026110123001111000000000007', '商家订单号', '00000000000000011111',
+    ].join('\n'),
+    extra: [{
+      name: bank, kind: 'payment', text: [
+        '收支详情', '-147.35', '交易卡号', '4321****1234', '交易时间', '2026-11-01',
+        '业务摘要', '消费', '交易场所', '支付宝-示例货商', '交易金额', '147.35', '记账币种', '人民币',
+      ].join('\n'),
+    }],
+  });
+  const cache = join(app.appDir, '.runtime/cache', encodeURIComponent(app.folder));
+  const selectionFile = join(cache, (await readdir(cache)).find((name) => name.startsWith('selection-')));
+  const selection = JSON.parse(await readFile(selectionFile, 'utf8'));
+  selection.upload = selection.upload.filter((name) => name !== bank);
+  await writeFile(selectionFile, JSON.stringify(selection));
+  const verify = (plan) => {
+    assert.equal(plan.status, 'ready', JSON.stringify(plan.blockers));
+    assert.equal(plan.totalCny, 14735);
+    assert.equal(plan.paidTotalCny, 14735);
+    assert.equal(plan.paymentCandidates.length, 1);
+    assert.ok(['支付.png', bank].every((name) => plan.uploadFiles.includes(name)), JSON.stringify(plan.uploadFiles));
+  };
+  const initial = await app.plan();
+  verify(initial);
+
+  await app.stop();
+  const planFile = join(app.appDir, '.runtime/plans.json');
+  const plans = JSON.parse(await readFile(planFile, 'utf8'));
+  const savedLinks = { [initial.rows[0].invoiceNumber]: ['支付.png', bank] };
+  plans.find(({ id }) => id === initial.id).confirmations = { fingerprint: initial.fingerprint, paymentLinks: savedLinks };
+  await writeFile(planFile, JSON.stringify(plans));
+  await app.start();
+  const updated = await app.request(`/api/plans/${initial.id}/confirmations`, {
+    fingerprint: initial.fingerprint, paymentCardConfirmed: true,
+  });
+  assert.equal(updated.status, 200, JSON.stringify(updated.body));
+  assert.deepEqual(updated.body.plan.confirmations.paymentLinks, savedLinks);
+  verify(updated.body.plan);
+  verify(await app.plan());
+});
+
 test('attachment review sends the batch text to the selected model and computes amounts locally', async (t) => {
   const app = await setup(t, {
     order: null,

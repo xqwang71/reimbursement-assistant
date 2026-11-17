@@ -222,7 +222,7 @@ test('copies of a settled wallet bill use its payment order number', () => {
   assert.equal(unrelated.status, 'blocked');
 });
 
-test('an identical wallet debit and bank receipt uniquely linked to one order count once', () => {
+test('the wallet discount and bank debit both stay attached to one verified payment', () => {
   const wallet = payment(1, 75750, { transactionId: null, date: '2026-07-08', text: walletBill('2026070823001111000000000001') });
   const text = [
     '收支详情', '-757.50', '交易卡号', '1234****8765', '交易时间', '2026-07-08',
@@ -230,15 +230,22 @@ test('an identical wallet debit and bank receipt uniquely linked to one order co
   ].join('\n');
   const bank = payment(2, 75750, { date: wallet.date, text });
   const matches = { '发票1.pdf': link(null, wallet.file.name, bank.file.name) };
-  const result = assess([invoice(1, 76000), wallet, bank], {
-    selection: { matches, upload: [wallet.file.name, bank.file.name] },
-  });
-  assert.equal(result.status, 'ready');
-  assert.equal(result.paidTotalCny, 75750);
-  assert.equal(result.totalCny, 75750);
-  assert.equal(result.paymentCandidates.length, 1);
-  assert.ok(result.paymentKeys.includes('file:sha-支付2.png'));
-  assert.ok(result.uploadNames.includes(bank.file.name));
+  for (const paymentFiles of [matches['发票1.pdf'].payment, [wallet.file.name], [bank.file.name]]) {
+    const result = assess([invoice(1, 76000), wallet, bank], {
+      selection: { matches: { '发票1.pdf': link(null, ...paymentFiles) } },
+    });
+    assert.equal(result.status, 'ready');
+    assert.equal(result.paidTotalCny, 75750);
+    assert.equal(result.totalCny, 75750);
+    assert.equal(result.paymentCandidates.length, 1);
+    assert.ok(result.paymentKeys.includes('file:sha-支付2.png'));
+    assert.ok(result.uploadNames.includes(wallet.file.name));
+    assert.ok(result.uploadNames.includes(bank.file.name));
+    assert.match(result.warnings.join(' '), /银行立减 2\.50 元/);
+  }
+
+  const wrongDiscount = { ...wallet, text: wallet.text.replace('-2.50', '-1.50') };
+  assert.equal(assess([invoice(1, 76000), wrongDiscount, bank], { selection: { matches } }).paymentCandidates.length, 2);
 
   for (const changed of [
     text.replace('8765', '1111'), text.replace('示例客户', '测试商家'),

@@ -2165,13 +2165,16 @@ async function route(request, response) {
       if (folderHasOpenRun(sourceRoot, previous.folder)) throw httpError(409, '本笔正在执行或待核实，请先处理当前任务再改材料或金额');
       if (input.fingerprint !== previous.fingerprint) throw httpError(409, '附件已变化，材料确认已失效');
       const confirmations = { fingerprint: input.fingerprint };
-      const paymentLinks = input.paymentLinks ?? previous.confirmations?.paymentLinks;
+      const savedPaymentLinks = previous.confirmations?.paymentLinks;
+      const paymentLinks = input.paymentLinks ?? savedPaymentLinks;
       if (paymentLinks !== undefined) {
         const invoices = new Set(previous.rows.map(({ invoiceNumber }) => invoiceNumber));
         const payments = new Set(previous.paymentCandidates?.map(({ name }) => name));
+        // A confirmed file may now be an additional proof under the same payment.
         if (!previous.paymentCandidates || !paymentLinks || typeof paymentLinks !== 'object' || Array.isArray(paymentLinks) ||
             Object.entries(paymentLinks).some(([invoice, names]) => !invoices.has(invoice) || !Array.isArray(names) ||
-              new Set(names).size !== names.length || names.some((name) => !payments.has(name)))) {
+              new Set(names).size !== names.length || names.some((name) => !payments.has(name) &&
+                !savedPaymentLinks?.[invoice]?.includes(name)))) {
           throw httpError(400, '请选择本次检查中识别到的发票和有效付款凭证。');
         }
         confirmations.paymentLinks = paymentLinks;
