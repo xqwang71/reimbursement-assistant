@@ -1324,8 +1324,9 @@ test('manual payment links validate the evidence and survive rechecking unchange
   const files = await readdir(cache);
   await Promise.all(files.filter((name) => name.startsWith('selection-')).map((name) => unlink(join(cache, name))));
   const initial = await app.plan();
-  assert.equal(initial.status, 'blocked');
+  assert.equal(initial.status, 'ready');
   const [invoice] = initial.rows;
+  assert.equal(invoice.amountBasis, '按文件夹合计分摊');
   const payment = initial.paymentCandidates[0].name;
   const confirm = (names) => app.request(`/api/plans/${initial.id}/confirmations`, {
     fingerprint: initial.fingerprint, paymentLinks: { [invoice.invoiceNumber]: names },
@@ -1340,7 +1341,8 @@ test('manual payment links validate the evidence and survive rechecking unchange
   await writeFile(join(app.batchDir, '补充材料.bin'), '本地模拟附件');
   const rechecked = await app.plan(undefined, { confirm: false });
   assert.equal(rechecked.confirmations.paymentLinks, undefined);
-  assert.equal(rechecked.status, 'blocked');
+  assert.equal(rechecked.rows[0].amountBasis, '按文件夹合计分摊');
+  assert.equal(rechecked.totalCny, 10000);
 });
 
 test('attachment review sends the batch text to the selected model and computes amounts locally', async (t) => {
