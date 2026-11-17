@@ -229,6 +229,61 @@ test('per-invoice minimum survives an exactly reconciled combined payment', () =
   assert.match(offsetting.blockers.join(' '), /金额差额过大/);
 });
 
+test('a combined payment can be split by matched invoices with partial matching order totals', () => {
+  const invoices = [invoice(1, 8100), invoice(2, 14200), invoice(3, 9630)];
+  const documents = [...invoices, order(1, 8100), order(2, 14200), payment(1, 31930)];
+  const selection = { matches: {
+    '发票1.pdf': link('订单1.pdf', '支付1.png'),
+    '发票2.pdf': link('订单2.pdf', '支付1.png'),
+    '发票3.pdf': link(null, '支付1.png'),
+  } };
+  const result = assess(documents, { selection });
+  assert.equal(result.status, 'ready');
+  assert.equal(result.totalCny, 31930);
+  assert.deepEqual(result.rows.map(({ paidAmountCny }) => paidAmountCny), [8100, 14200, 9630]);
+
+  const conflicting = assess([...invoices, order(1, 8010), ...documents.slice(4)], { selection });
+  assert.equal(conflicting.status, 'blocked');
+  assert.equal(conflicting.totalCny, null);
+  assert.ok(conflicting.rows.every(({ needsAllocation }) => needsAllocation));
+});
+
+test('small combined payment differences are split in cents and keep invoice caps', () => {
+  const invoices = [invoice(1, 8401), invoice(2, 6612), invoice(3, 3912)];
+  const invoiceTotal = 18925;
+  const selection = { matches: {
+    '发票1.pdf': link('订单1.pdf', '支付1.png'),
+    '发票2.pdf': link(null, '支付1.png'),
+    '发票3.pdf': link(null, '支付1.png'),
+  } };
+  for (const difference of [-500, -1, 1, 500]) {
+    const actual = invoiceTotal + difference;
+    const result = assess([...invoices, order(1, 8401), payment(1, actual)], { selection });
+    assert.equal(result.status, 'ready');
+    assert.equal(result.paidTotalCny, actual);
+    assert.equal(result.rows[0].paidAmountCny, 8401);
+    assert.equal(result.totalCny, Math.min(invoiceTotal, actual));
+    assert.ok(result.rows.every((row) =>
+      row.amountBasis === '合并付款小额差异按发票分摊' &&
+      row.reimbursementAmountCny === Math.min(row.invoiceAmountCny, row.paidAmountCny)));
+  }
+
+  const aboveTolerance = assess([...invoices, order(1, 8401), payment(1, invoiceTotal + 501)], { selection });
+  assert.equal(aboveTolerance.status, 'blocked');
+  assert.equal(aboveTolerance.totalCny, null);
+  assert.ok(aboveTolerance.rows.every(({ needsAllocation }) => needsAllocation));
+
+  const orders = [order(1, 8401), order(2, 6612), order(3, 3912)];
+  const allMatched = { matches: {
+    '发票1.pdf': link('订单1.pdf', '支付1.png'),
+    '发票2.pdf': link('订单2.pdf', '支付1.png'),
+    '发票3.pdf': link('订单3.pdf', '支付1.png'),
+  } };
+  const adjusted = assess([...invoices, ...orders, payment(1, invoiceTotal - 350)], { selection: allMatched });
+  assert.equal(adjusted.status, 'ready');
+  assert.equal(adjusted.totalCny, invoiceTotal - 350);
+});
+
 test('a repeated order needs a manual allocation that matches the combined payment', () => {
   const documents = [invoice(1, 10000), invoice(2, 10000), order(1, 10000), payment(1, 20000)];
   const selection = { matches: {
