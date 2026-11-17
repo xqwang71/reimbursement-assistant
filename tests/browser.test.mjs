@@ -1924,6 +1924,39 @@ test('a discounted grouped detail is filled on the verified draft and reconciles
   await amount.fill('100.00');
   await assert.rejects(instance.verifyDetailAmounts(), /Unexpected amount review/);
   assert.equal(instance.progress.detailVerified, false);
+
+  const previous = { id: 'previous-ended-run', status: 'abandoned', resolved: true,
+    plan: structuredClone(plan), control: { cancelled: true, progress: structuredClone(instance.progress) } };
+  previous.plan.project.balanceCny = 50000;
+  const resumed = new ReimbursementExecutor({
+    plan, appDir: '/private/tmp', previousRuns: [previous], resumeStages: true, control: {},
+    onEvent() {}, ask: async () => { throw Error('Unexpected recovery question'); },
+  });
+  resumed.page = page;
+  for (const change of [
+    (record) => { record.plan.fingerprint = 'changed-attachments'; },
+    (record) => { record.plan.project.projectNo = 'ANOTHER-PROJECT'; },
+    (record) => { record.control.progress.uploadPageId = 'another-browser-tab'; },
+    (record) => { record.control.progress.fillingId = 'another-draft'; },
+    (record) => { record.control.progress.submission.state = 'verified'; },
+  ]) {
+    const different = structuredClone(previous);
+    change(different);
+    resumed.previousRuns = [different];
+    assert.equal(await resumed.reconnectDraft(), false);
+    assert.equal(await amount.inputValue(), '100.00');
+    assert.equal(resumed.progress.recoveredFromRunId, undefined);
+  }
+  resumed.previousRuns = [previous];
+  resumed.openPlatform = async () => {};
+  resumed.fillPayment = async () => 'confirm';
+  resumed.confirmAndFinish = async () => 'preview';
+  assert.equal(await resumed.run(), 'preview');
+  assert.equal(await amount.inputValue(), '90.00');
+  assert.equal(resumed.progress.recoveredFromRunId, previous.id);
+  assert.equal(resumed.progress.detailVerified, true);
+  assert.equal(previous.control.progress.detailVerified, false);
+  assert.equal(previous.control.cancelled, true);
 });
 
 test('a school-truncated grouped purpose is shown for approval and rechecked before submission', async (t) => {
