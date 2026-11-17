@@ -230,12 +230,15 @@ test('an identical wallet debit and bank receipt uniquely linked to one order co
   ].join('\n');
   const bank = payment(2, 75750, { date: wallet.date, text });
   const matches = { '发票1.pdf': link(null, wallet.file.name, bank.file.name) };
-  const result = assess([invoice(1, 76000), wallet, bank], { selection: { matches } });
+  const result = assess([invoice(1, 76000), wallet, bank], {
+    selection: { matches, upload: [wallet.file.name, bank.file.name] },
+  });
   assert.equal(result.status, 'ready');
   assert.equal(result.paidTotalCny, 75750);
   assert.equal(result.totalCny, 75750);
   assert.equal(result.paymentCandidates.length, 1);
   assert.ok(result.paymentKeys.includes('file:sha-支付2.png'));
+  assert.ok(result.uploadNames.includes(bank.file.name));
 
   for (const changed of [
     text.replace('8765', '1111'), text.replace('示例客户', '测试商家'),
